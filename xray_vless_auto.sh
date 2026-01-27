@@ -1,7 +1,97 @@
 #!/bin/bash
 set -e
 
-echo "========== Xray 自动部署脚本 =========="
+# 配置文件路径
+CONFIG_FILE_PATH="${1:-/root/xray_install.conf}"
+
+# 配置文件处理函数
+load_config() {
+  if [ -f "$CONFIG_FILE_PATH" ]; then
+    echo "[OK] 检测到配置文件: $CONFIG_FILE_PATH"
+    source "$CONFIG_FILE_PATH"
+    return 0
+  else
+    return 1
+  fi
+}
+
+# 生成配置文件模板
+generate_config_template() {
+  local template_path="$CONFIG_FILE_PATH"
+  mkdir -p "$(dirname "$template_path")"
+  
+  cat > "$template_path" << 'CONFIGEOF'
+# Xray 自动安装配置文件
+# 请填写以下参数，留空的字段将使用默认值
+
+# 必填项
+DOMAIN="example.com"
+PORT="443"
+CERT_FILE="/path/to/cert.pem"
+KEY_FILE="/path/to/key.pem"
+
+# 可选项（默认值已预设）
+XRAY_DIR="/root/xray"
+XRAY_VERSION="26.1.23"
+VLESS_FLOW="xtls-rprx-vision"
+INITIAL_REMARK="初始用户"
+
+# 下载方式：1=GitHub推荐版本, 2=自定义URL, 3=本地文件
+INSTALL_SOURCE="1"
+XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip"
+XRAY_ZIP_LOCAL=""
+
+# 信息文件保存路径
+INFO_FILE="/root/xray_info.txt"
+XUSER_SCRIPT="/root/xuser.sh"
+CONFIGEOF
+
+  echo "[OK] 已生成配置文件模板: $template_path"
+  echo "请编辑配置文件并填写参数后，再次运行本脚本"
+  echo ""
+  echo "关键参数说明:"
+  echo "  DOMAIN        - 服务器域名（必填）"
+  echo "  PORT          - 监听端口（必填）"
+  echo "  CERT_FILE     - SSL 证书文件路径（必填）"
+  echo "  KEY_FILE      - SSL 私钥文件路径（必填）"
+  echo ""
+}
+
+echo "========== Xray VLESS 自动部署脚本 =========="
+
+# 检查是否需要交互式配置
+if [ ! -f "$CONFIG_FILE_PATH" ]; then
+  echo "==> 首次运行，需要配置"
+  read -p "请输入配置文件保存路径 [默认 $CONFIG_FILE_PATH]: " custom_path
+  if [ -n "$custom_path" ]; then
+    CONFIG_FILE_PATH="$custom_path"
+  fi
+  
+  generate_config_template
+  exit 0
+fi
+
+# 尝试加载配置
+if ! load_config; then
+  generate_config_template
+  exit 0
+fi
+
+# 验证必填配置
+if [ -z "$DOMAIN" ] || [ -z "$PORT" ] || [ -z "$CERT_FILE" ] || [ -z "$KEY_FILE" ]; then
+  echo "[ERR] 配置文件中缺少必填参数"
+  echo "请编辑 $CONFIG_FILE_PATH 并填写以下必填项:"
+  echo "  - DOMAIN: 服务器域名"
+  echo "  - PORT: 监听端口"
+  echo "  - CERT_FILE: 证书路径"
+  echo "  - KEY_FILE: 私钥路径"
+  exit 1
+fi
+
+# 使用配置中的值覆盖默认值
+XRAY_DIR="${XRAY_DIR:-/root/xray}"
+INFO_FILE="${INFO_FILE:-/root/xray_info.txt}"
+XUSER_SCRIPT="${XUSER_SCRIPT:-/root/xuser.sh}"
 
 ### 0. 环境 & 依赖检查
 echo "==> 检测运行环境"
@@ -32,35 +122,37 @@ done
 
 ### 1. 选择 Xray 来源
 echo
-echo "请选择 Xray 安装方式（推荐 26.1.23）："
-echo "1) 安装推荐版本 Xray 26.1.23（稳定，已验证）【推荐】"
-echo "2) 使用自定义下载链接"
-echo "3) 使用已上传到服务器的压缩文件"
-read -p "请输入选项 [1-3]: " SRC
+echo "==> 下载和安装 Xray"
+
+# 如果使用配置文件，直接使用配置中的安装源
+if [ "$INSTALL_SOURCE" = "1" ]; then
+  XRAY_URL="${XRAY_URL:-https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip}"
+  echo "==> 下载 Xray 26.1.23"
+elif [ "$INSTALL_SOURCE" = "2" ]; then
+  XRAY_URL="${XRAY_URL:-https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip}"
+  echo "==> 使用自定义 URL: $XRAY_URL"
+elif [ "$INSTALL_SOURCE" = "3" ]; then
+  if [ -z "$XRAY_ZIP_LOCAL" ]; then
+    echo "[ERR] 配置文件中未指定本地压缩文件路径"
+    exit 1
+  fi
+  echo "==> 使用本地文件: $XRAY_ZIP_LOCAL"
+else
+  echo "[ERR] 未知的安装源设置"
+  exit 1
+fi
 
 TMP_DIR="/tmp/xray_install"
 mkdir -p $TMP_DIR
 cd $TMP_DIR
 
-if [ "$SRC" = "1" ]; then
-  XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip"
-  echo "==> 下载 Xray 26.1.23"
-  curl -L -o xray.zip "$XRAY_URL"
-elif [ "$SRC" = "2" ]; then
-  read -p "请输入 Xray 下载链接: " XRAY_URL
-  curl -L -o xray.zip "$XRAY_URL"
-elif [ "$SRC" = "3" ]; then
-  read -p "请输入 Xray 压缩文件完整路径: " XRAY_ZIP
-  cp "$XRAY_ZIP" xray.zip
+if [ "$INSTALL_SOURCE" = "3" ]; then
+  cp "$XRAY_ZIP_LOCAL" xray.zip
 else
-  echo "[ERR] 选项错误"
-  exit 1
+  curl -L -o xray.zip "$XRAY_URL"
 fi
 
 ### 2. 安装位置
-read -p "请输入 Xray 安装目录 [默认 /root/xray]: " XRAY_DIR
-XRAY_DIR=${XRAY_DIR:-/root/xray}
-
 mkdir -p "$XRAY_DIR"
 unzip -o xray.zip -d "$XRAY_DIR"
 chmod +x "$XRAY_DIR/xray"
@@ -71,12 +163,30 @@ echo "==> Xray 版本确认"
 ### 3. 生成配置（UUID 自动生成）
 UUID=$("$XRAY_DIR/xray" uuid)
 
-read -p "请输入监听端口: " PORT
-read -p "请输入域名 (serverName): " DOMAIN
-read -p "请输入证书文件路径 (certificateFile): " CERT
-read -p "请输入私钥文件路径 (keyFile): " KEY
+# 从配置文件读取参数（已在开始时加载）
+# PORT、DOMAIN、CERT、KEY 已从配置文件读取
+CERT="$CERT_FILE"
+KEY="$KEY_FILE"
+
+# 检查证书和密钥文件是否存在
+if [ ! -f "$CERT" ]; then
+  echo "[ERR] 证书文件不存在: $CERT"
+  exit 1
+fi
+if [ ! -f "$KEY" ]; then
+  echo "[ERR] 私钥文件不存在: $KEY"
+  exit 1
+fi
 
 CONFIG_FILE="$XRAY_DIR/config.json"
+
+echo "==> 使用配置参数:"
+echo "    域名: $DOMAIN"
+echo "    端口: $PORT"
+echo "    证书: $CERT"
+echo "    私钥: $KEY"
+echo "    Xray 目录: $XRAY_DIR"
+echo ""
 
 cat > "$CONFIG_FILE" << EOF
 {
@@ -160,14 +270,13 @@ systemctl enable xray
 systemctl restart xray
 
 ### 6. 生成链接并保存
-VLESS_LINK="vless://$UUID@$DOMAIN:$PORT?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=$DOMAIN#vless-vision"
+# 使用备注作为链接名字
+INITIAL_REMARK="${INITIAL_REMARK:-初始用户}"
+VLESS_LINK="vless://$UUID@$DOMAIN:$PORT?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=$DOMAIN#$INITIAL_REMARK"
 
-read -p "请输入链接保存路径 [默认 /root/xray_info.txt]: " SAVE_PATH
-SAVE_PATH=${SAVE_PATH:-/root/xray_info.txt}
-
-cat > "$SAVE_PATH" << EOF
+cat > "$INFO_FILE" << EOF
 Xray 安装目录: $XRAY_DIR
-Xray 版本: 26.1.23
+Xray 版本: ${XRAY_VERSION:-26.1.23}
 域名: $DOMAIN
 端口: $PORT
 
@@ -182,13 +291,11 @@ EOF
 echo
 echo "========== 部署完成 =========="
 echo "$VLESS_LINK"
-echo "已保存到: $SAVE_PATH"
+echo "已保存到: $INFO_FILE"
 
 ### 7. 生成 xuser.sh（用户管理脚本）
-read -p "请输入 xuser.sh 保存路径 [默认 /root/xuser.sh]: " XUSER_PATH
-XUSER_PATH=${XUSER_PATH:-/root/xuser.sh}
 
-cat > "$XUSER_PATH" << 'EOFXUSER'
+cat > "$XUSER_SCRIPT" << 'EOFXUSER'
 #!/bin/bash
 set -e
 
@@ -276,6 +383,7 @@ add_user() {
   UUID="$($BIN uuid)"
 
   # 向 clients 数组中插入新用户
+  # 找到最后一个 client 并在其后添加逗号和新 client
   sed -i "/\"clients\": \[/a\\          {\n            \"id\": \"$UUID\",\n            \"flow\": \"xtls-rprx-vision\",\n            \"email\": \"$REMARK\"\n          }," "$CONFIG_FILE"
 
   echo "[OK] 添加成功"
@@ -311,7 +419,8 @@ del_user() {
     return 1
   fi
 
-  # 使用 python3 安全删除（推荐）
+  # 删除包含该 KEY 的整个 client 对象（多行）
+  # 使用更安全的方式处理多行对象
   python3 -c "
 import json
 import sys
@@ -320,6 +429,7 @@ try:
     with open('$CONFIG_FILE', 'r') as f:
         config = json.load(f)
     
+    # 在 clients 中查找并删除
     original_count = len(config['inbounds'][0]['settings']['clients'])
     config['inbounds'][0]['settings']['clients'] = [
         c for c in config['inbounds'][0]['settings']['clients']
@@ -338,9 +448,11 @@ except Exception as e:
     print(f'[ERR] 错误: {e}')
     sys.exit(1)
   " 2>/dev/null || {
-    # 降级方案：使用 sed
+    # 如果 python3 不可用，使用 sed 方法（不安全但能用）
     sed -i "/\"id\": \"$KEY\"/,/}/d" "$CONFIG_FILE"
     sed -i "/\"email\": \"$KEY\"/,/}/d" "$CONFIG_FILE"
+    # 清理多余的逗号
+    sed -i ':a;N;$!ba;s/},\n          }/}\n          }/g' "$CONFIG_FILE"
     echo "[OK] 删除成功（使用 sed 方式）"
   }
 
@@ -352,6 +464,16 @@ except Exception as e:
 # 列出所有用户
 list_user() {
   echo "=== 当前用户列表 ==="
+  
+  # 获取域名和端口
+  DOMAIN="$(get_domain)"
+  PORT="$(get_port)"
+  
+  if [ -z "$DOMAIN" ] || [ -z "$PORT" ]; then
+    echo "[ERR] 无法获取域名或端口信息"
+    return 1
+  fi
+  
   if ! grep -q "\"email\":" "$CONFIG_FILE"; then
     echo "（暂无备注用户）"
     return 0
@@ -363,27 +485,35 @@ try:
     with open('$CONFIG_FILE', 'r') as f:
         config = json.load(f)
     
+    domain = '$DOMAIN'
+    port = '$PORT'
+    
     for i, client in enumerate(config['inbounds'][0]['settings']['clients'], 1):
         email = client.get('email', '(未设置)')
         uuid = client.get('id', '(未知)')
+        # 生成配置链接，使用备注作为链接名
+        vless_link = f'vless://{uuid}@{domain}:{port}?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni={domain}#{email}'
+        
         print(f'{i}. 备注: {email}')
         print(f'   UUID: {uuid}')
+        print(f'   链接: {vless_link}')
         print()
 except Exception as e:
     print(f'错误: {e}')
   " 2>/dev/null || {
-    # 降级方案：使用 awk
-    awk '
+    # 如果 python3 不可用，使用 grep/awk
+    awk -v domain="$DOMAIN" -v port="$PORT" '
       /"id":/ { 
         id=\$2; 
         gsub(/[",]/, "", id);
-        printf "   UUID: %s\n", id;
+        client_id=id;
       }
       /"email":/ { 
         email=\$2; 
         gsub(/[",]/, "", email);
         printf "备注: %s\n", email;
-        printf "\n"
+        printf "UUID: %s\n", client_id;
+        printf "链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, email;
       }
     ' "$CONFIG_FILE"
   }
@@ -391,7 +521,7 @@ except Exception as e:
 
 # 一键卸载
 uninstall() {
-  read -p "[WARN] 确认卸载 Xray？此操作不可恢复 [y/N]: " C
+  read -p "[WARN]  确认卸载 Xray？此操作不可恢复 [y/N]: " C
   [[ "$C" != "y" ]] && { echo "已取消"; return 0; }
 
   echo "==> 停止 Xray 服务"
@@ -413,11 +543,11 @@ show_menu() {
   echo "╔════════════════════════════════════════╗"
   echo "║  Xray 用户管理工具 (xuser.sh)          ║"
   echo "╚════════════════════════════════════════╝"
-  echo "1) 添加用户"
-  echo "2) 删除用户"
-  echo "3) 列出所有用户"
-  echo "4) 更新 xray_info.txt"
-  echo "5) 一键卸载 Xray"
+  echo "1)  添加用户"
+  echo "2)  删除用户"
+  echo "3)  列出所有用户"
+  echo "4)  更新 xray_info.txt"
+  echo "5)  一键卸载 Xray"
   echo "0) 退出"
   echo
 }
@@ -439,15 +569,20 @@ while true; do
 done
 EOFXUSER
 
-chmod +x "$XUSER_PATH"
-echo "==> xuser.sh 已生成: $XUSER_PATH"
-echo "==> 运行命令：bash $XUSER_PATH 进行用户管理"
+chmod +x "$XUSER_SCRIPT"
+echo "[OK] xuser.sh 已生成: $XUSER_SCRIPT"
+echo "[OK] 运行命令：bash $XUSER_SCRIPT 进行用户管理"
 
 # 导出环境变量供 xuser.sh 使用
 cat > /root/.xray_env << EOF
 export XRAY_DIR="$XRAY_DIR"
-export CONFIG_FILE="$CONFIG_FILE"
-export INFO_FILE="$SAVE_PATH"
+export CONFIG_FILE="$XRAY_DIR/config.json"
+export INFO_FILE="$INFO_FILE"
 EOF
 
 echo "[OK] 环境配置已保存到 /root/.xray_env"
+echo ""
+echo "[OK] 配置文件已保存: $CONFIG_FILE_PATH"
+echo "[OK] 用户信息已保存: $INFO_FILE"
+echo ""
+echo "初始用户 VLESS 链接: $VLESS_LINK"

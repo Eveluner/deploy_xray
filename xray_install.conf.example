@@ -1,0 +1,93 @@
+# Xray 自动安装配置文件示例
+# 请复制此文件为 xray_install.conf 并填写参数后运行脚本
+
+# ==========================================
+# 必填项 - 这些参数必须填写
+# ==========================================
+
+# 服务器域名（必填）
+# 示例: example.com
+DOMAIN="example.com"
+
+# 监听端口（必填）
+# 示例: 443, 8443 等
+PORT="443"
+
+# SSL 证书文件路径（必填）
+# 示例: /etc/ssl/certs/example.com.crt 或 /root/cert.pem
+CERT_FILE="/path/to/cert.pem"
+
+# SSL 私钥文件路径（必填）
+# 示例: /etc/ssl/private/example.com.key 或 /root/key.pem
+KEY_FILE="/path/to/key.pem"
+
+# ==========================================
+# 可选项 - 可根据需要修改或留空使用默认值
+# ==========================================
+
+# Xray 安装目录（默认: /root/xray）
+XRAY_DIR="/root/xray"
+
+# Xray 版本（默认: 26.1.23）
+XRAY_VERSION="26.1.23"
+
+# VLESS Flow 类型（默认: xtls-rprx-vision）
+VLESS_FLOW="xtls-rprx-vision"
+
+# 初始用户备注（默认: 初始用户）
+# 这个备注会显示在 VLESS 链接中作为链接名
+INITIAL_REMARK="初始用户"
+
+# ==========================================
+# 下载方式配置
+# ==========================================
+
+# 安装源方式
+# 1 = GitHub 推荐版本（默认）
+# 2 = 自定义下载链接
+# 3 = 使用本地压缩文件
+INSTALL_SOURCE="1"
+
+# 当 INSTALL_SOURCE=1 时使用的 URL（默认为 GitHub）
+XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip"
+
+# 当 INSTALL_SOURCE=3 时需要指定本地压缩文件路径
+# 示例: /root/Xray-linux-64.zip
+XRAY_ZIP_LOCAL=""
+
+# ==========================================
+# 输出文件路径
+# ==========================================
+
+# 用户信息保存路径（默认: /root/xray_info.txt）
+INFO_FILE="/root/xray_info.txt"
+
+# xuser.sh 管理脚本保存路径（默认: /root/xuser.sh）
+XUSER_SCRIPT="/root/xuser.sh"
+
+# ==========================================
+# 使用说明
+# ==========================================
+
+# 1. 首次运行脚本：
+#    bash xray_vless_auto.sh /path/to/xray_install.conf
+#    
+#    脚本会：
+#    - 检测配置文件
+#    - 如果不存在，生成模板文件
+#    - 提示编辑配置文件
+
+# 2. 编辑配置文件：
+#    - 填写上面的必填项
+#    - 其他项可保持默认或自定义
+#    - 保存文件
+
+# 3. 再次运行脚本：
+#    bash xray_vless_auto.sh /path/to/xray_install.conf
+#    
+#    脚本会：
+#    - 读取配置文件
+#    - 验证所有必填项
+#    - 按配置自动安装 Xray
+#    - 生成 VLESS 链接
+#    - 生成用户管理脚本 xuser.sh
