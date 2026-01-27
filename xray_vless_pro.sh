@@ -221,6 +221,12 @@ update_info() {
   PORT="$(get_port)"
   XRAY_DIR="$(get_xray_dir)"
 
+  # 如果 DOMAIN 或 PORT 为空，返回错误
+  if [ -z "$DOMAIN" ] || [ -z "$PORT" ]; then
+    echo "[ERR] 无法从 xray_info.txt 读取域名或端口"
+    return 1
+  fi
+
   cat > "$INFO_FILE" << EOF
 Xray 安装目录: $XRAY_DIR
 Xray 版本: 26.1.23
@@ -233,7 +239,7 @@ VLESS 连接信息:
 EOF
 
   # 从配置中提取用户信息
-  awk '
+  awk -v domain="$DOMAIN" -v port="$PORT" '
     /"id":/ { 
       id=$2; 
       gsub(/[",]/, "", id);
@@ -245,7 +251,7 @@ EOF
       if (client_id != "") {
         printf "备注: %s\n", email;
         printf "UUID: %s\n", client_id;
-        printf "VLESS 链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s\n\n", client_id, ENVIRON["DOMAIN"], ENVIRON["PORT"], ENVIRON["DOMAIN"];
+        printf "VLESS 链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s\n\n", client_id, domain, port, domain;
         client_id="";
       }
     }
