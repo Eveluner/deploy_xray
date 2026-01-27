@@ -153,7 +153,7 @@ add_user() {
   echo "UUID: $UUID"
 
   update_info
-  systemctl reload xray || systemctl restart xray
+  systemctl restart xray
 }
 
 del_user() {
@@ -163,7 +163,7 @@ del_user() {
   sed -i "/$KEY/d" "$CONFIG"
 
   update_info
-  systemctl reload xray || systemctl restart xray
+  systemctl restart xray
   echo "✅ 已删除: $KEY"
 }
 
