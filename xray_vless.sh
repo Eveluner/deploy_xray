@@ -78,10 +78,7 @@ cat > $CONFIG_FILE << EOF
             }
           ],
           "minVersion": "1.3",
-          "cipherSuites": [
-            "TLS_AES_128_GCM_SHA256",
-            "TLS_AES_256_GCM_SHA384"
-          ],
+          "cipherSuites": "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384",
           "alpn": ["h2"],
           "preferServerCipherSuites": false,
           "rejectUnknownSni": false
