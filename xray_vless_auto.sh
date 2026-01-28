@@ -298,6 +298,7 @@ echo "已保存到: $INFO_FILE"
 cat > "$XUSER_SCRIPT" << 'EOFXUSER'
 #!/bin/bash
 set -e
+set +H
 
 # ==========================
 # Xray 用户管理脚本 xuser.sh
