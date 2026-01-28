@@ -358,7 +358,7 @@ EOF
       if (client_id != "") {
         printf "备注: %s\n", email;
         printf "UUID: %s\n", client_id;
-        printf "VLESS 链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s\n\n", client_id, domain, port, domain;
+        printf "VLESS 链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, email;
         client_id="";
       }
     }
