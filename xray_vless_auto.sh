@@ -7,58 +7,28 @@ CONFIG_FILE_PATH="${1:-/root/xray_install.conf}"
 # 配置文件处理函数
 load_config() {
   if [ -f "$CONFIG_FILE_PATH" ]; then
-  # 生成 UUID
-  UUID="$($BIN uuid)"
-
-  # 如果系统有 python3，可用 Python 进行安全的 JSON 操作，避免用户备注包含
-  # 引号、反斜杠等字符导致配置损坏。
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$REMARK" "$UUID" <<'PY'
-import sys, json
-config_path = "$CONFIG_FILE"
-remark = sys.argv[1]
-uuid = sys.argv[2]
-try:
-    with open(config_path, 'r') as f:
-        cfg = json.load(f)
-    clients = cfg['inbounds'][0]['settings']['clients']
-    # 重复检查
-    if any(c.get('email') == remark for c in clients):
-        print('[ERR] 备注已存在')
-        sys.exit(1)
-    clients.append({'id': uuid, 'flow': 'xtls-rprx-vision', 'email': remark})
-    with open(config_path, 'w') as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print('[OK] 添加成功')
-    print(f'备注: {remark}')
-    print(f'UUID: {uuid}')
-except Exception as e:
-    print(f'[ERR] {e}')
-    sys.exit(1)
-PY
-    if [ $? -ne 0 ]; then
-      return 1
-    fi
+    echo "[OK] 检测到配置文件: $CONFIG_FILE_PATH"
+    source "$CONFIG_FILE_PATH"
+    return 0
   else
-    # 旧版 sed 插入方法 (仍保留以便没有 Python 的系统使用)
-    if grep -q "\"email\": \"$REMARK\"" "$CONFIG_FILE"; then
-      echo "[ERR] 备注已存在"
-      return 1
-    fi
-
-    sed -i "/\"clients\": \[/a\\          {\n            \"id\": \"$UUID\",\n            \"flow\": \"xtls-rprx-vision\",\n            \"email\": \"$REMARK\"\n          }," "$CONFIG_FILE"
-
-    echo "[OK] 添加成功"
-    echo "备注: $REMARK"
-    echo "UUID: $UUID"
-  fi
-
-  # 验证配置
-  if ! "$BIN" run -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
-    echo "[ERR] 配置验证失败，回滚更改..."
-    git -C "$(dirname $CONFIG_FILE)" checkout "$CONFIG_FILE" 2>/dev/null || true
     return 1
   fi
+}
+
+# 生成配置文件模板
+generate_config_template() {
+  local template_path="$CONFIG_FILE_PATH"
+  mkdir -p "$(dirname "$template_path")"
+  
+  cat > "$template_path" << 'CONFIGEOF'
+# Xray 自动安装配置文件
+# 请填写以下参数，留空的字段将使用默认值
+
+# 必填项
+DOMAIN="example.com"
+PORT="443"
+CERT_FILE="/path/to/cert.pem"
+KEY_FILE="/path/to/key.pem"
 
 # 可选项（默认值已预设）
 XRAY_DIR="/root/xray"
