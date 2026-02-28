@@ -272,7 +272,9 @@ systemctl restart xray
 ### 6. 生成链接并保存
 # 使用备注作为链接名字
 INITIAL_REMARK="${INITIAL_REMARK:-初始用户}"
-VLESS_LINK="vless://$UUID@$DOMAIN:$PORT?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=$DOMAIN#$INITIAL_REMARK"
+# encode spaces in remark for URI fragment
+REMARK_ESCAPED="${INITIAL_REMARK// /%20}"
+VLESS_LINK="vless://$UUID@$DOMAIN:$PORT?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=$DOMAIN#$REMARK_ESCAPED"
 
 cat > "$INFO_FILE" << EOF
 Xray 安装目录: $XRAY_DIR
@@ -283,7 +285,7 @@ Xray 版本: ${XRAY_VERSION:-26.1.23}
 VLESS 连接信息:
 ================
 
-备注: 初始用户
+备注: $INITIAL_REMARK
 UUID: $UUID
 VLESS 链接: $VLESS_LINK
 EOF
@@ -353,13 +355,17 @@ EOF
       gsub(/[",]/, "", id);
       client_id=id;
     }
-    /"email":/ { 
-      email=$2; 
-      gsub(/[",]/, "", email);
+    /"email":/ {
+      # capture everything between the first and last quote after email:
+      match($0, /"email"[[:space:]]*:[[:space:]]*"(.*)"/, arr);
+      email=arr[1];
       if (client_id != "") {
         printf "备注: %s\n", email;
         printf "UUID: %s\n", client_id;
-        printf "VLESS 链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, email;
+        # encode spaces in remark for URI fragment
+        remark_enc=email;
+        gsub(/ /, "%20", remark_enc);
+        printf "VLESS 链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, remark_enc;
         client_id="";
       }
     }
@@ -491,11 +497,13 @@ try:
     domain = '$DOMAIN'
     port = '$PORT'
     
+    import urllib.parse
     for i, client in enumerate(config['inbounds'][0]['settings']['clients'], 1):
         email = client.get('email', '(未设置)')
         uuid = client.get('id', '(未知)')
-        # 生成配置链接，使用备注作为链接名
-        vless_link = f'vless://{uuid}@{domain}:{port}?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni={domain}#{email}'
+        # 生成配置链接，使用备注作为链接名，空格会转换为%%20
+        frag = urllib.parse.quote(email, safe='')
+        vless_link = f'vless://{uuid}@{domain}:{port}?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni={domain}#{frag}'
         
         print(f'{i}. 备注: {email}')
         print(f'   UUID: {uuid}')
@@ -518,12 +526,14 @@ except Exception as e:
         gsub(/[",]/, "", id);
         client_id=id;
       }
-      /"email":/ { 
-        email=\$2; 
-        gsub(/[",]/, "", email);
+      /"email":/ {
+        match($0, /"email"[[:space:]]*:[[:space:]]*"(.*)"/, arr);
+        email=arr[1];
         printf "备注: %s\n", email;
         printf "UUID: %s\n", client_id;
-        printf "链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, email;
+        remark_enc=email;
+        gsub(/ /, "%20", remark_enc);
+        printf "链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, remark_enc;
       }
     ' "$CONFIG_FILE"
   }
