@@ -334,174 +334,58 @@ vless://UUID@domain:port?encryption=none&flow=xtls-rprx-vision&security=tls&type
 - `#备注` - 用户备注（链接标识符）
 
 ---
+# deploy_xray
 
-## 🐛 故障排查
+轻量的 Xray VLESS 一键部署与用户管理脚本集合，用于在支持 systemd 的 Linux 主机上快速部署 Xray 服务并生成 VLESS 链接。
 
-### 问题 1：配置文件找不到（xray_vless_auto.sh）
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-**症状：** 脚本提示 `配置文件不存在`
+概览：本仓库包含若干用于不同场景的部署脚本（从简单交互式到生产级自动化、支持 ECH、流量限速与 API 统计），并在安装后生成 `xuser.sh` 管理脚本用于添加/删除/列出用户。
 
-**解决方案：**
-```bash
-# 首次运行会自动生成
-bash xray_vless_auto.sh
+主要文件
+- `xray_vless.sh` — 最简单的交互式安装脚本，逐步询问下载源、端口、域名与证书，生成 `config.json` 与 systemd 服务。
+- `xray_vless_pro.sh` — 增强版交互脚本，生成带 `email` 字段的初始用户并自动写入 `xuser.sh`（带 Python3 回退），保存环境变量到 `/root/.xray_env`。
+- `xray_vless_auto.sh` — 基于配置文件的自动安装器（配置模板见 `xray_install.conf.example`），适合批量或无人值守部署，会生成 `xuser.sh` 和 `xray_info.txt`。
+- `xray_vless_auto_2.sh` — `xray_vless_auto.sh` 的扩展，增加了可通过脚本管理 Xray 服务（启动/停止/更新）和更多菜单选项。
+- `xray_vless_auto_3.sh` — 更健壮的自动化版本（推荐用于生产）：严格的输入校验、架构检测、原子写入、内置 Python3 JSON 操作、自动检测并安装依赖、生成安全的 systemd unit、写入环境文件并生成 `xuser.sh`。
+- `xray_vless_auto_ech.sh` — 支持 ECH 的自动化脚本，允许在配置中启用 ECH（可选）并把 ECH 状态写入 `xray_info.txt`。
+- `xray_vless_auto_limit.sh` — 支持流量统计与限速的扩展脚本，启用 Xray API（本地绑定）用于收集统计并在 `xuser.sh` 中提供限流管理功能。
+- `xray_install.conf.example` — 自动化脚本的配置文件示例（复制并填写为 `/root/xray_install.conf`）。
 
-# 检查配置文件是否存在
-ls -la /root/xray_install.conf
+快速开始（推荐）
+- 生成并编辑配置模板：
+  ```bash
+  bash xray_vless_auto_3.sh  # 首次运行会生成配置模板（默认 /root/xray_install.conf）
+  cp xray_install.conf.example /root/xray_install.conf
+  nano /root/xray_install.conf
+  ```
+- 填写必填项（`DOMAIN`, `PORT`, `CERT_FILE`, `KEY_FILE`），保存后再次运行：
+  ```bash
+  bash xray_vless_auto_3.sh /root/xray_install.conf
+  ```
+- 部署完成后：
+  - 用户管理脚本：`/root/xuser.sh`（或根据配置的路径）
+  - 用户信息与链接：`/root/xray_info.txt`
+  - Xray 安装目录（默认）：`/root/xray`
 
-# 如果不存在，手动复制示例
-cp xray_install.conf.example /root/xray_install.conf
-```
+选择建议
+- 开发/测试：使用 `xray_vless.sh` 或 `xray_vless_pro.sh` 交互安装。
+- 无人值守/生产：优先使用 `xray_vless_auto_3.sh`（更严谨的校验和原子操作）。
+- 需要 ECH：使用 `xray_vless_auto_ech.sh` 并在配置中启用 `USE_ECH`。
+- 需要用户流量统计/限速：使用 `xray_vless_auto_limit.sh`（启用 API 并配置 `API_PORT`）。
 
-### 问题 2：Xray 启动失败
+系统要求与依赖
+- 操作系统：支持 systemd 的 Linux 发行版（Ubuntu/CentOS/Debian 等）。
+- 权限：需 root 或 sudo 权限。
+- 依赖：`curl`, `unzip`, `python3`（部分脚本对 Python3 有依赖，但均提供 sed 回退）。
 
-**症状：** `systemctl status xray` 显示 `inactive`
+安全与注意事项
+- 请确保 `CERT_FILE` 使用完整证书链（Let's Encrypt 使用 `fullchain.pem`）。
+- 请勿把配置或私钥文件保存在不受信任的位置。自动化脚本会把部分环境信息写到 `/root/.xray_env`，请按需保护该文件权限。
+- `xray_vless_auto_3.sh` 在写配置时使用原子替换策略以减少因意外中断导致的配置损坏。
 
-**解决方案：**
-```bash
-# 检查配置文件语法
-/root/xray/xray run -test -config /root/xray/config.json
+贡献与问题
+- 发现问题或功能建议，请在仓库中打开 issue。
 
-# 查看详细错误信息
-journalctl -u xray -e
-
-# 常见原因：
-# - 证书/私钥路径错误
-# - 端口已被占用
-# - 权限问题
-```
-
-### 问题 3：证书不被信任
-
-**症状：** 客户端连接时收到证书不信任警告
-
-**解决方案：**
-```bash
-# 检查证书是否有效
-openssl x509 -in /path/to/cert.pem -text -noout
-
-# 确保使用完整证书链
-# 对于 Let's Encrypt：
-# - 使用 fullchain.pem（不是 cert.pem）
-# - 私钥使用 privkey.pem
-```
-
-### 问题 4：Python3 不可用
-
-**症状：** 脚本显示需要 Python3
-
-**解决方案：**
-```bash
-# 脚本会自动降级到 sed 方案，无需操作
-# 如果需要 Python3：
-sudo apt update && sudo apt install python3  # Debian/Ubuntu
-sudo yum install python3                     # CentOS/RHEL
-```
-
-### 问题 5：用户添加失败
-
-**症状：** 运行 xuser.sh 添加用户失败
-
-**解决方案：**
-```bash
-# 检查配置文件是否存在
-ls -la /root/xray/config.json
-
-# 检查权限
-ls -la /root/xray/
-
-# 确保 Xray 有权限读写配置文件
-sudo chown -R root:root /root/xray/
-
-# 检查 systemctl 是否能访问
-systemctl is-active xray
-```
-
----
-
-## ❓ 常见问题
-
-### Q: 这个项目是什么？
-
-A: 这是一套自动化脚本，用于快速部署 Xray VLESS 协议服务器。它处理所有复杂的配置和设置，让你只需填写几个参数即可拥有一个可用的 VLESS 服务器。
-
-### Q: 哪个脚本最适合我？
-
-A: 
-- **如果你需要批量部署或自动化** → 使用 `xray_vless_auto.sh`
-- **如果你是第一次部署或只需标准功能** → 使用 `xray_vless_v2.sh`
-- **如果你的终端支持 Emoji** → 使用 `xray_vless_pro.sh`
-
-### Q: 可以添加多少个用户？
-
-A: 理论上无限制，受系统资源和网络带宽限制。每个用户对应一个 UUID，配置文件中可以存储任意数量的 UUID。
-
-### Q: 可以修改端口吗？
-
-A: 可以。修改 `/root/xray/config.json` 中的 `inbound.port`，然后重启服务：
-```bash
-systemctl restart xray
-```
-
-### Q: 脚本支持 IPv6 吗？
-
-A: 脚本本身支持 IPv6，但需要在配置中指定 IPv6 地址或域名，且确保防火墙允许 IPv6 连接。
-
-### Q: 可以在同一台服务器上运行多个实例吗？
-
-A: 可以，但需要使用不同的端口和配置文件。建议将 Xray 目录更改为不同路径。
-
-### Q: 如何备份配置？
-
-A: 备份以下文件：
-```bash
-# 备份配置
-cp /root/xray/config.json /backup/config.json.bak
-
-# 备份用户信息
-cp /root/xray_info.txt /backup/xray_info.txt.bak
-```
-
-### Q: 如何卸载？
-
-A: 使用 xuser.sh 的卸载功能，或手动执行：
-```bash
-# 停止服务
-systemctl stop xray
-
-# 禁用自启
-systemctl disable xray
-
-# 删除服务文件
-rm /etc/systemd/system/xray.service
-
-# 删除 Xray 目录
-rm -rf /root/xray
-
-# 删除脚本和信息文件
-rm /root/xuser.sh /root/xray_info.txt
-```
-
----
-
-## 📄 许可证
-
-MIT License - 详见 [LICENSE](LICENSE) 文件
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
----
-
-## 📞 技术支持
-
-- 📋 查看 [故障排查](#故障排查) 部分
-- 💬 提交 GitHub Issue
-- 📖 查看脚本注释和示例配置
-
----
-
-**最后更新：** 2026 年 1 月 27 日
+许可证
+- 本项目采用 Apache License 2.0，详见 `LICENSE`。
