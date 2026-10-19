@@ -1,9 +1,9 @@
 #!/bin/bash
 set -Eeuo pipefail
 set +H
+umask 077
 
 DEFAULT_CONFIG_FILE="/root/xray_install.conf"
-DEFAULT_XRAY_VERSION="26.1.23"
 DEFAULT_VLESS_FLOW="xtls-rprx-vision"
 DEFAULT_SERVICE_NAME="xray"
 
@@ -44,6 +44,7 @@ backup_file() {
   [ -f "$file" ] || return 0
   backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
   cp -a "$file" "$backup"
+  chmod 600 "$backup"
   ok "已备份: $backup"
 }
 
@@ -81,12 +82,12 @@ KEY_FILE="/path/to/key.pem"
 
 # 可选项
 XRAY_DIR="/root/xray"
-XRAY_VERSION="26.1.23"
+# XRAY_VERSION 会从安装后的 Xray 二进制自动识别，无需手动设置。
 XRAY_ARCH="auto"
 VLESS_FLOW="xtls-rprx-vision"
 INITIAL_REMARK="初始用户"
 
-# 下载方式：1=按指定版本从 GitHub 下载, 2=自定义 URL, 3=本地 zip 文件, 4=GitHub 最新版
+# 下载方式：1=GitHub 最新版, 2=用户指定下载链接, 3=本地 zip 文件
 INSTALL_SOURCE="1"
 XRAY_URL=""
 XRAY_ZIP_LOCAL=""
@@ -107,6 +108,9 @@ CONFIGEOF
   echo "  PORT          - 监听端口（必填，1-65535）"
   echo "  CERT_FILE     - SSL 证书文件路径（必填）"
   echo "  KEY_FILE      - SSL 私钥文件路径（必填）"
+  echo "  INSTALL_SOURCE - 1=GitHub 最新版, 2=用户指定下载链接, 3=本地 zip 文件"
+  echo "  XRAY_URL      - INSTALL_SOURCE=2 时填写下载链接"
+  echo "  XRAY_ZIP_LOCAL- INSTALL_SOURCE=3 时填写本地 zip 文件路径"
   echo "  XRAY_ARCH     - auto/64/arm64-v8a/arm32-v7a 等 release 架构名"
   echo
 }
@@ -118,13 +122,16 @@ normalize_config() {
   KEY_FILE="${KEY_FILE:-}"
 
   XRAY_DIR="${XRAY_DIR:-/root/xray}"
-  XRAY_VERSION="${XRAY_VERSION:-$DEFAULT_XRAY_VERSION}"
-  XRAY_VERSION="${XRAY_VERSION#v}"
+  XRAY_VERSION=""
   XRAY_ARCH="${XRAY_ARCH:-auto}"
   VLESS_FLOW="${VLESS_FLOW:-$DEFAULT_VLESS_FLOW}"
   INITIAL_REMARK="${INITIAL_REMARK:-初始用户}"
 
   INSTALL_SOURCE="${INSTALL_SOURCE:-1}"
+  # Earlier templates used 4 for GitHub latest; keep those configurations working.
+  if [ "$INSTALL_SOURCE" = "4" ]; then
+    INSTALL_SOURCE="1"
+  fi
   XRAY_URL="${XRAY_URL:-}"
   XRAY_ZIP_LOCAL="${XRAY_ZIP_LOCAL:-}"
 
@@ -172,11 +179,12 @@ validate_config() {
   [ -n "$CERT_FILE" ] || die "配置文件中缺少 CERT_FILE"
   [ -n "$KEY_FILE" ] || die "配置文件中缺少 KEY_FILE"
 
+  if [ "${#DOMAIN}" -gt 253 ] ||
+    ! [[ "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$ ]]; then
+    die "DOMAIN 必须是有效的 DNS 主机名，且每个标签不能以连字符开头或结尾"
+  fi
   if contains_newline "$DOMAIN"; then
     die "DOMAIN 不能包含换行符"
-  fi
-  if [[ "$DOMAIN" =~ [[:space:]] ]]; then
-    die "DOMAIN 不能包含空白字符"
   fi
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     die "PORT 必须是 1-65535 之间的数字"
@@ -208,9 +216,8 @@ validate_config() {
       [ -f "$XRAY_ZIP_LOCAL" ] || die "本地压缩文件不存在: $XRAY_ZIP_LOCAL"
       [ -r "$XRAY_ZIP_LOCAL" ] || die "本地压缩文件不可读: $XRAY_ZIP_LOCAL"
       ;;
-    4) ;;
     *)
-      die "INSTALL_SOURCE 只能是 1、2、3 或 4"
+      die "INSTALL_SOURCE 只能是 1、2 或 3"
       ;;
   esac
 }
@@ -287,27 +294,19 @@ resolve_xray_source() {
 
   case "$INSTALL_SOURCE" in
     1)
-      arch="$XRAY_ARCH"
-      if [ "$arch" = "auto" ]; then
-        arch="$(detect_xray_arch)"
-      fi
-      XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${arch}.zip"
-      log "下载 Xray ${XRAY_VERSION} (${arch})"
-      ;;
-    2)
-      log "使用自定义 URL: $XRAY_URL"
-      ;;
-    3)
-      log "使用本地文件: $XRAY_ZIP_LOCAL"
-      ;;
-    4)
       XRAY_VERSION="$(get_latest_xray_version)"
       arch="$XRAY_ARCH"
       if [ "$arch" = "auto" ]; then
         arch="$(detect_xray_arch)"
       fi
       XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${arch}.zip"
-      log "下载 Xray 最新版 ${XRAY_VERSION} (${arch})"
+      log "从 GitHub 下载最新版 Xray ${XRAY_VERSION} (${arch})"
+      ;;
+    2)
+      log "从用户指定链接下载 Xray: $XRAY_URL"
+      ;;
+    3)
+      log "从本地 zip 文件安装 Xray: $XRAY_ZIP_LOCAL"
       ;;
   esac
 }
@@ -337,6 +336,15 @@ install_xray() {
       install -m 0644 "$unpack_dir/$data_file" "$XRAY_DIR/$data_file"
     fi
   done
+}
+
+detect_installed_xray_version() {
+  local version_output
+
+  version_output="$("$XRAY_BIN" version)" || die "无法读取已安装的 Xray 版本"
+  XRAY_VERSION="$(printf '%s\n' "$version_output" | awk 'NR == 1 && $1 == "Xray" { print $2 }')"
+  [ -n "$XRAY_VERSION" ] || die "无法从 Xray 版本信息中识别版本号"
+  printf '%s\n' "$version_output"
 }
 
 write_xray_config() {
@@ -415,7 +423,7 @@ config = {
                     "cipherSuites": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
                     "alpn": ["h2"],
                     "preferServerCipherSuites": False,
-                    "rejectUnknownSni": False,
+                    "rejectUnknownSni": True,
                 },
                 "sockopt": {
                     "tcpFastOpen": True,
@@ -437,6 +445,7 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(config, f, ensure_ascii=False, indent=2)
     f.write("\n")
 PY
+  chmod 600 "$CONFIG_FILE"
 }
 
 test_xray_config() {
@@ -535,6 +544,7 @@ with open(info_file, "w", encoding="utf-8") as f:
 print(first_link)
 PY
   )"
+  chmod 600 "$INFO_FILE"
 }
 
 write_env_file() {
@@ -563,6 +573,7 @@ generate_xuser_script() {
     printf '#!/bin/bash\n'
     printf 'set -Eeuo pipefail\n'
     printf 'set +H\n\n'
+    printf 'umask 077\n\n'
     printf 'XRAY_ENV_FILE=%q\n\n' "$XRAY_ENV_FILE"
     cat <<'EOFXUSER'
 
@@ -896,6 +907,7 @@ with open(info_file, "w", encoding="utf-8") as f:
         f.write(f"UUID: {uuid}\n")
         f.write(f"VLESS 链接: {make_link(uuid, remark, flow, alpn)}\n\n")
 PY
+  chmod 600 "$INFO_FILE"
 }
 
 add_user() {
@@ -1222,7 +1234,7 @@ prepare_xray_zip
 install_xray
 
 echo "==> Xray 版本确认"
-"$XRAY_BIN" version
+detect_installed_xray_version
 
 log "生成 Xray 配置"
 echo "    域名: $DOMAIN"
