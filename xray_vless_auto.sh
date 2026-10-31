@@ -1,14 +1,34 @@
 #!/bin/bash
 set -Eeuo pipefail
-set +H
 umask 077
 
 DEFAULT_CONFIG_FILE="/root/xray_install.conf"
 DEFAULT_VLESS_FLOW="xtls-rprx-vision"
 DEFAULT_SERVICE_NAME="xray"
 
+if [ "$#" -gt 1 ]; then
+  echo "用法: $0 [配置文件路径]" >&2
+  exit 2
+fi
+
 CONFIG_FILE_PATH="${1:-$DEFAULT_CONFIG_FILE}"
 TMP_DIR=""
+XRAY_CANDIDATE=""
+CONFIG_CANDIDATE=""
+BACKUP_FILE_PATH=""
+XRAY_BACKUP_PATH=""
+CONFIG_BACKUP_PATH=""
+SERVICE_BACKUP_PATH=""
+GEOIP_BACKUP_PATH=""
+GEOSITE_BACKUP_PATH=""
+CONFIG_CHANGED=0
+XRAY_CHANGED=0
+SERVICE_CHANGED=0
+GEOIP_CHANGED=0
+GEOSITE_CHANGED=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+SERVICE_ENABLE_ATTEMPTED=0
 
 cleanup() {
   if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
@@ -34,17 +54,21 @@ ensure_parent_dir() {
   local path="$1"
   local dir
   dir="$(dirname "$path")"
-  mkdir -p "$dir"
+  mkdir -p -m 0700 "$dir"
 }
 
 backup_file() {
   local file="$1"
   local backup
 
+  BACKUP_FILE_PATH=""
   [ -f "$file" ] || return 0
-  backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
-  cp -a "$file" "$backup"
-  chmod 600 "$backup"
+  backup="$(mktemp "${file}.bak.XXXXXX")" || return 1
+  if ! cp -a "$file" "$backup" || ! chmod 600 "$backup"; then
+    rm -f "$backup"
+    return 1
+  fi
+  BACKUP_FILE_PATH="$backup"
   ok "已备份: $backup"
 }
 
@@ -100,6 +124,7 @@ SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_NAME="xray"
 CONFIGEOF
 
+  chmod 600 "$template_path"
   ok "已生成配置文件模板: $template_path"
   echo "请编辑配置文件并填写参数后，再次运行本脚本"
   echo
@@ -122,16 +147,14 @@ normalize_config() {
   KEY_FILE="${KEY_FILE:-}"
 
   XRAY_DIR="${XRAY_DIR:-/root/xray}"
-  XRAY_VERSION=""
+  while [[ "$XRAY_DIR" == */ ]]; do
+    XRAY_DIR="${XRAY_DIR%/}"
+  done
   XRAY_ARCH="${XRAY_ARCH:-auto}"
   VLESS_FLOW="${VLESS_FLOW:-$DEFAULT_VLESS_FLOW}"
   INITIAL_REMARK="${INITIAL_REMARK:-初始用户}"
 
   INSTALL_SOURCE="${INSTALL_SOURCE:-1}"
-  # Earlier templates used 4 for GitHub latest; keep those configurations working.
-  if [ "$INSTALL_SOURCE" = "4" ]; then
-    INSTALL_SOURCE="1"
-  fi
   XRAY_URL="${XRAY_URL:-}"
   XRAY_ZIP_LOCAL="${XRAY_ZIP_LOCAL:-}"
 
@@ -164,6 +187,12 @@ validate_path_value() {
 
 validate_xray_dir() {
   validate_path_value "XRAY_DIR" "$XRAY_DIR"
+  [[ "$XRAY_DIR" == /* ]] || die "XRAY_DIR 必须是绝对路径"
+  case "$XRAY_DIR" in
+    *"/../"*|*/..)
+      die "XRAY_DIR 不能包含 .. 路径片段"
+      ;;
+  esac
 
   case "$XRAY_DIR" in
     /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
@@ -200,6 +229,13 @@ validate_config() {
   validate_path_value "XUSER_SCRIPT" "$XUSER_SCRIPT"
   validate_path_value "XRAY_ENV_FILE" "$XRAY_ENV_FILE"
   validate_path_value "SYSTEMD_DIR" "$SYSTEMD_DIR"
+  contains_newline "$INITIAL_REMARK" && die "INITIAL_REMARK 不能包含换行符"
+  if [ -n "$VLESS_FLOW" ] && ! [[ "$VLESS_FLOW" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "VLESS_FLOW 只能包含字母、数字、点、下划线和连字符"
+  fi
+  if ! [[ "$XRAY_ARCH" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "XRAY_ARCH 只能包含字母、数字、点、下划线和连字符"
+  fi
 
   [ -f "$CERT_FILE" ] || die "证书文件不存在: $CERT_FILE"
   [ -r "$CERT_FILE" ] || die "证书文件不可读: $CERT_FILE"
@@ -210,6 +246,8 @@ validate_config() {
     1) ;;
     2)
       [ -n "$XRAY_URL" ] || die "INSTALL_SOURCE=2 时必须填写 XRAY_URL"
+      [[ "$XRAY_URL" =~ ^https?://[^[:space:]]+$ ]] ||
+        die "XRAY_URL 必须是有效的 HTTP 或 HTTPS URL"
       ;;
     3)
       [ -n "$XRAY_ZIP_LOCAL" ] || die "INSTALL_SOURCE=3 时必须填写 XRAY_ZIP_LOCAL"
@@ -281,7 +319,8 @@ detect_xray_arch() {
 get_latest_xray_version() {
   local tag
 
-  tag="$(curl --fail --location --retry 3 --connect-timeout 15 --silent \
+  tag="$(curl --fail --location --retry 3 --connect-timeout 15 --max-time 30 --silent --show-error \
+    --proto '=https' --proto-redir '=https' \
     "https://api.github.com/repos/XTLS/Xray-core/releases/latest" |
     python3 -c 'import json, re, sys; tag=json.load(sys.stdin).get("tag_name", ""); print(tag if re.fullmatch(r"v?[0-9]+(\.[0-9]+){2}([.-][A-Za-z0-9.-]+)?", tag) else "")')" \
     || die "无法获取 Xray 最新版本"
@@ -312,36 +351,31 @@ resolve_xray_source() {
 }
 
 prepare_xray_zip() {
-  TMP_DIR="$(mktemp -d /tmp/xray_install.XXXXXX)"
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/xray_install.XXXXXX")"
 
   if [ "$INSTALL_SOURCE" = "3" ]; then
     cp "$XRAY_ZIP_LOCAL" "$TMP_DIR/xray.zip"
   else
-    curl --fail --location --retry 3 --connect-timeout 15 --output "$TMP_DIR/xray.zip" "$XRAY_URL"
+    curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 --show-error \
+      --proto '=https,http' --proto-redir '=https,http' \
+      --output "$TMP_DIR/xray.zip" "$XRAY_URL"
   fi
 }
 
 install_xray() {
   local unpack_dir="$TMP_DIR/unpacked"
-  local data_file
-
-  mkdir -p "$unpack_dir" "$XRAY_DIR"
+  mkdir -p -m 0700 "$unpack_dir"
   unzip -oq "$TMP_DIR/xray.zip" -d "$unpack_dir"
 
   [ -f "$unpack_dir/xray" ] || die "压缩包中未找到 xray 可执行文件"
-  install -m 0755 "$unpack_dir/xray" "$XRAY_BIN"
-
-  for data_file in geoip.dat geosite.dat; do
-    if [ -f "$unpack_dir/$data_file" ]; then
-      install -m 0644 "$unpack_dir/$data_file" "$XRAY_DIR/$data_file"
-    fi
-  done
+  chmod 0755 "$unpack_dir/xray"
+  XRAY_CANDIDATE="$unpack_dir/xray"
 }
 
-detect_installed_xray_version() {
+detect_candidate_xray_version() {
   local version_output
 
-  version_output="$("$XRAY_BIN" version)" || die "无法读取已安装的 Xray 版本"
+  version_output="$("$XRAY_CANDIDATE" version)" || die "无法读取待安装的 Xray 版本"
   XRAY_VERSION="$(printf '%s\n' "$version_output" | awk 'NR == 1 && $1 == "Xray" { print $2 }')"
   [ -n "$XRAY_VERSION" ] || die "无法从 Xray 版本信息中识别版本号"
   printf '%s\n' "$version_output"
@@ -350,12 +384,12 @@ detect_installed_xray_version() {
 write_xray_config() {
   local new_uuid
 
-  new_uuid="$("$XRAY_BIN" uuid)"
+  new_uuid="$("$XRAY_CANDIDATE" uuid)"
 
-  ensure_parent_dir "$CONFIG_FILE"
-  backup_file "$CONFIG_FILE"
+  CONFIG_CANDIDATE="$TMP_DIR/config.json"
 
   CONFIG_FILE_OUT="$CONFIG_FILE" \
+  CONFIG_FILE_CANDIDATE="$CONFIG_CANDIDATE" \
   DOMAIN_VALUE="$DOMAIN" \
   PORT_VALUE="$PORT" \
   CERT_VALUE="$CERT_FILE" \
@@ -368,13 +402,14 @@ import json
 import os
 import tempfile
 
-path = os.environ["CONFIG_FILE_OUT"]
+path = os.environ["CONFIG_FILE_CANDIDATE"]
+existing_path = os.environ["CONFIG_FILE_OUT"]
 flow = os.environ["FLOW_VALUE"]
 clients = []
 
-if os.path.exists(path):
+if os.path.exists(existing_path):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(existing_path, "r", encoding="utf-8") as f:
             old_config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"[ERR] 无法读取现有配置，拒绝覆盖: {exc}")
@@ -471,17 +506,123 @@ except Exception:
         pass
     raise
 PY
-  chmod 600 "$CONFIG_FILE"
 }
 
 test_xray_config() {
   log "校验配置文件"
-  "$XRAY_BIN" run -test -config "$CONFIG_FILE"
+  "$XRAY_CANDIDATE" run -test -config "$CONFIG_CANDIDATE"
+}
+
+commit_xray_config() {
+  local replacement
+
+  ensure_parent_dir "$CONFIG_FILE" || return 1
+  backup_file "$CONFIG_FILE" || return 1
+  CONFIG_BACKUP_PATH="$BACKUP_FILE_PATH"
+  replacement="${CONFIG_FILE}.new.$$"
+  install -m 0600 "$CONFIG_CANDIDATE" "$replacement" || return 1
+  if ! mv -f "$replacement" "$CONFIG_FILE"; then
+    rm -f "$replacement"
+    return 1
+  fi
+  CONFIG_CHANGED=1
+}
+
+commit_xray_install() {
+  local replacement
+  local data_file
+
+  mkdir -p -m 0700 "$XRAY_DIR" || return 1
+  backup_file "$XRAY_BIN" || return 1
+  XRAY_BACKUP_PATH="$BACKUP_FILE_PATH"
+  replacement="${XRAY_BIN}.new.$$"
+  install -m 0755 "$XRAY_CANDIDATE" "$replacement" || return 1
+  if ! mv -f "$replacement" "$XRAY_BIN"; then
+    rm -f "$replacement"
+    return 1
+  fi
+  XRAY_CHANGED=1
+
+  for data_file in geoip.dat geosite.dat; do
+    if [ -f "$TMP_DIR/unpacked/$data_file" ]; then
+      backup_file "$XRAY_DIR/$data_file" || return 1
+      case "$data_file" in
+        geoip.dat)
+          GEOIP_BACKUP_PATH="$BACKUP_FILE_PATH"
+          GEOIP_CHANGED=1
+          ;;
+        geosite.dat)
+          GEOSITE_BACKUP_PATH="$BACKUP_FILE_PATH"
+          GEOSITE_CHANGED=1
+          ;;
+      esac
+      replacement="$XRAY_DIR/.${data_file}.new.$$"
+      install -m 0644 "$TMP_DIR/unpacked/$data_file" "$replacement" || return 1
+      if ! mv -f "$replacement" "$XRAY_DIR/$data_file"; then
+        rm -f "$replacement"
+        return 1
+      fi
+    fi
+  done
+}
+
+restore_deployment_file() {
+  local target="$1"
+  local backup="$2"
+
+  if [ -n "$backup" ]; then
+    cp -a "$backup" "$target"
+  else
+    rm -f "$target"
+  fi
+}
+
+rollback_deployment() {
+  local rollback_failed=0
+
+  if [ "$CONFIG_CHANGED" -eq 1 ]; then
+    restore_deployment_file "$CONFIG_FILE" "$CONFIG_BACKUP_PATH" ||
+      { err "无法恢复配置文件"; rollback_failed=1; }
+  fi
+  if [ "$XRAY_CHANGED" -eq 1 ]; then
+    restore_deployment_file "$XRAY_BIN" "$XRAY_BACKUP_PATH" ||
+      { err "无法恢复 Xray 二进制文件"; rollback_failed=1; }
+  fi
+  if [ "$GEOIP_CHANGED" -eq 1 ]; then
+    restore_deployment_file "$XRAY_DIR/geoip.dat" "$GEOIP_BACKUP_PATH" ||
+      { err "无法恢复 geoip.dat"; rollback_failed=1; }
+  fi
+  if [ "$GEOSITE_CHANGED" -eq 1 ]; then
+    restore_deployment_file "$XRAY_DIR/geosite.dat" "$GEOSITE_BACKUP_PATH" ||
+      { err "无法恢复 geosite.dat"; rollback_failed=1; }
+  fi
+  if [ "$SERVICE_CHANGED" -eq 1 ]; then
+    if [ "$SERVICE_ENABLE_ATTEMPTED" -eq 1 ]; then
+      systemctl disable "$SERVICE_NAME" || rollback_failed=1
+    fi
+    restore_deployment_file "$SERVICE_FILE" "$SERVICE_BACKUP_PATH" ||
+      { err "无法恢复 systemd unit"; rollback_failed=1; }
+    systemctl daemon-reload || rollback_failed=1
+    if [ "$SERVICE_WAS_ENABLED" -eq 1 ]; then
+      systemctl enable "$SERVICE_NAME" || rollback_failed=1
+    fi
+    if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+      systemctl restart "$SERVICE_NAME" || {
+        err "旧版 Xray 服务未能恢复启动"
+        rollback_failed=1
+      }
+    else
+      systemctl stop "$SERVICE_NAME" || rollback_failed=1
+    fi
+  fi
+  [ "$rollback_failed" -eq 0 ]
 }
 
 write_systemd_service() {
-  ensure_parent_dir "$SERVICE_FILE"
-  backup_file "$SERVICE_FILE"
+  ensure_parent_dir "$SERVICE_FILE" || return 1
+  backup_file "$SERVICE_FILE" || return 1
+  SERVICE_BACKUP_PATH="$BACKUP_FILE_PATH"
+  SERVICE_CHANGED=1
 
   cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -500,12 +641,28 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 0644 "$SERVICE_FILE"
 }
 
 restart_service() {
-  systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME"
-  systemctl restart "$SERVICE_NAME"
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    SERVICE_WAS_ACTIVE=1
+  fi
+  if systemctl is-enabled --quiet "$SERVICE_NAME"; then
+    SERVICE_WAS_ENABLED=1
+  fi
+
+  if ! systemctl daemon-reload; then
+    err "systemd 重新加载失败，正在回滚部署"
+    rollback_deployment || err "自动回滚未能完整完成，请检查备份文件"
+    return 1
+  fi
+  SERVICE_ENABLE_ATTEMPTED=1
+  if ! systemctl enable "$SERVICE_NAME" || ! systemctl restart "$SERVICE_NAME"; then
+    err "systemd 服务启动失败，正在回滚部署"
+    rollback_deployment || err "自动回滚未能完整完成，请检查备份文件"
+    return 1
+  fi
 }
 
 write_info_file() {
@@ -610,7 +767,7 @@ generate_xuser_script() {
   {
     printf '#!/bin/bash\n'
     printf 'set -Eeuo pipefail\n'
-    printf 'set +H\n\n'
+    printf '\n'
     printf 'umask 077\n\n'
     printf 'XRAY_ENV_FILE=%q\n\n' "$XRAY_ENV_FILE"
     cat <<'EOFXUSER'
@@ -661,24 +818,10 @@ require_runtime() {
   fi
 }
 
-get_info_value() {
-  local key="$1"
+read_config_field() {
+  local field="$1"
 
-  [ -f "$INFO_FILE" ] || return 0
-  awk -F': ' -v key="$key" '
-    index($0, key ":") == 1 {
-      sub("^[^:]*: ?", "")
-      value=$0
-    }
-    END { print value }
-  ' "$INFO_FILE"
-}
-
-current_domain() {
-  local value
-
-  if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
-    value="$(python3 - "$CONFIG_FILE" 2>/dev/null <<'PY' || true
+  python3 - "$CONFIG_FILE" "$field" <<'PY'
 import json
 import sys
 
@@ -686,14 +829,31 @@ with open(sys.argv[1], "r", encoding="utf-8") as f:
     config = json.load(f)
 
 inbounds = config.get("inbounds", [])
-if inbounds:
-    print(inbounds[0].get("streamSettings", {}).get("tlsSettings", {}).get("serverName") or "")
+if not isinstance(inbounds, list) or not inbounds or not isinstance(inbounds[0], dict):
+    raise SystemExit("[ERR] 配置文件中没有有效的 inbound")
+
+inbound = inbounds[0]
+if sys.argv[2] == "domain":
+    stream_settings = inbound.get("streamSettings", {})
+    if not isinstance(stream_settings, dict):
+        raise SystemExit("[ERR] 配置文件中的 streamSettings 格式无效")
+    tls_settings = stream_settings.get("tlsSettings", {})
+    if not isinstance(tls_settings, dict):
+        raise SystemExit("[ERR] 配置文件中的 tlsSettings 格式无效")
+    value = tls_settings.get("serverName")
+else:
+    value = inbound.get("port")
+print(value or "")
 PY
-    )"
-    if [ -n "$value" ]; then
-      printf '%s\n' "$value"
-      return 0
-    fi
+}
+
+current_domain() {
+  local value
+
+  value="$(read_config_field domain)" || return 1
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
   fi
 
   if [ -n "${DOMAIN:-}" ]; then
@@ -706,23 +866,10 @@ PY
 current_port() {
   local value
 
-  if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
-    value="$(python3 - "$CONFIG_FILE" 2>/dev/null <<'PY' || true
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    config = json.load(f)
-
-inbounds = config.get("inbounds", [])
-if inbounds:
-    print(inbounds[0].get("port") or "")
-PY
-    )"
-    if [ -n "$value" ]; then
-      printf '%s\n' "$value"
-      return 0
-    fi
+  value="$(read_config_field port)" || return 1
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
   fi
 
   if [ -n "${PORT:-}" ]; then
@@ -737,9 +884,11 @@ make_backup() {
   local backup
 
   dir="$(dirname "$CONFIG_FILE")"
-  backup="$(mktemp "$dir/.config.json.bak.XXXXXX")"
-  cp -a "$CONFIG_FILE" "$backup"
-  chmod 600 "$backup"
+  backup="$(mktemp "$dir/.config.json.bak.XXXXXX")" || return 1
+  if ! cp -a "$CONFIG_FILE" "$backup" || ! chmod 600 "$backup"; then
+    rm -f "$backup"
+    return 1
+  fi
   printf '%s\n' "$backup"
 }
 
@@ -819,7 +968,8 @@ show_xray_logs() {
 }
 
 latest_release_version() {
-  curl --fail --location --retry 3 --connect-timeout 15 --silent \
+  curl --fail --location --retry 3 --connect-timeout 15 --max-time 30 --silent --show-error \
+    --proto '=https' --proto-redir '=https' \
     "https://api.github.com/repos/XTLS/Xray-core/releases/latest" |
     python3 -c 'import json, re, sys; tag=json.load(sys.stdin).get("tag_name", ""); print(tag[1:] if tag.startswith("v") and re.fullmatch(r"v[0-9]+(\.[0-9]+){2}([.-][A-Za-z0-9.-]+)?", tag) else tag if re.fullmatch(r"[0-9]+(\.[0-9]+){2}([.-][A-Za-z0-9.-]+)?", tag) else "")'
 }
@@ -831,6 +981,8 @@ update_xray_latest() {
   local candidate
   local backup
   local replacement
+  local was_active=0
+  local command_name
 
   require_root || return 1
   require_runtime || return 1
@@ -866,51 +1018,95 @@ update_xray_latest() {
     esac
   fi
 
-  update_dir="$(mktemp -d /tmp/xray_update.XXXXXX)" || return 1
+  update_dir="$(mktemp -d "${TMPDIR:-/tmp}/xray_update.XXXXXX")" || return 1
   candidate="$update_dir/unpacked/xray"
   backup="$update_dir/xray.old"
-  replacement="${BIN}.new"
-  if ! curl --fail --location --retry 3 --connect-timeout 15 \
+  replacement="$(mktemp "${BIN}.new.XXXXXX")" || {
+    rm -rf "$update_dir"
+    return 1
+  }
+  if ! curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 --show-error \
+    --proto '=https' --proto-redir '=https' \
     --output "$update_dir/xray.zip" \
     "https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"; then
     err "下载 Xray ${version} 失败"
+    rm -f "$replacement"
     rm -rf "$update_dir"
     return 1
   fi
   if ! unzip -oq "$update_dir/xray.zip" -d "$update_dir/unpacked" || [ ! -f "$candidate" ]; then
     err "最新版压缩包无效或缺少 xray 可执行文件"
+    rm -f "$replacement"
     rm -rf "$update_dir"
     return 1
   fi
   chmod 0755 "$candidate"
   if ! "$candidate" run -test -config "$CONFIG_FILE"; then
     err "最新版无法通过当前配置校验，未更新"
+    rm -f "$replacement"
     rm -rf "$update_dir"
     return 1
   fi
 
-  cp -a "$BIN" "$backup"
-  if ! systemctl stop "$SERVICE_NAME" || ! install -m 0755 "$candidate" "$replacement" || ! mv -f "$replacement" "$BIN"; then
+  cp -a "$BIN" "$backup" || {
+    err "无法备份当前 Xray 二进制文件"
+    rm -f "$replacement"
+    rm -rf "$update_dir"
+    return 1
+  }
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    was_active=1
+    if ! systemctl stop "$SERVICE_NAME"; then
+      err "无法停止 Xray 服务，未执行更新"
+      rm -f "$replacement"
+      rm -rf "$update_dir"
+      return 1
+    fi
+  fi
+
+  if ! install -m 0755 "$candidate" "$replacement" || ! mv -f "$replacement" "$BIN"; then
     err "替换 Xray 二进制失败"
     rm -f "$replacement"
-    systemctl start "$SERVICE_NAME" || true
+    if [ "$was_active" -eq 1 ]; then
+      systemctl start "$SERVICE_NAME" || err "旧版 Xray 服务未能恢复启动"
+    fi
     rm -rf "$update_dir"
     return 1
   fi
-  if ! systemctl start "$SERVICE_NAME"; then
+  if [ "$was_active" -eq 1 ] && ! systemctl start "$SERVICE_NAME"; then
     err "最新版启动失败，正在恢复旧版本"
-    cp -a "$backup" "$BIN"
-    systemctl start "$SERVICE_NAME" || true
+    if ! install -m 0755 "$backup" "$replacement" || ! mv -f "$replacement" "$BIN"; then
+      err "旧版 Xray 二进制恢复失败"
+      rm -f "$replacement"
+      rm -rf "$update_dir"
+      return 1
+    fi
+    systemctl start "$SERVICE_NAME" || err "旧版 Xray 服务未能恢复启动"
     rm -rf "$update_dir"
     return 1
   fi
 
   XRAY_VERSION="$version"
   if [ -f "$XRAY_ENV_FILE" ]; then
-    sed -i "s/^export XRAY_VERSION=.*/export XRAY_VERSION=$(printf '%q' "$version")/" "$XRAY_ENV_FILE"
+    if ! sed -i "s/^export XRAY_VERSION=.*/export XRAY_VERSION=$(printf '%q' "$version")/" "$XRAY_ENV_FILE"; then
+      err "Xray 已更新，但无法更新环境文件中的版本号"
+      rm -f "$replacement"
+      rm -rf "$update_dir"
+      return 1
+    fi
   fi
-  update_info || err "Xray 已更新，但更新 xray_info.txt 失败"
-  echo "[OK] Xray 已更新至 ${version} 并启动"
+  if ! update_info; then
+    err "Xray 已更新，但更新 xray_info.txt 失败"
+    rm -f "$replacement"
+    rm -rf "$update_dir"
+    return 1
+  fi
+  if [ "$was_active" -eq 1 ]; then
+    echo "[OK] Xray 已更新至 ${version} 并启动"
+  else
+    echo "[OK] Xray 已更新至 ${version}，服务保持停止"
+  fi
+  rm -f "$replacement"
   rm -rf "$update_dir"
 }
 
@@ -1083,7 +1279,7 @@ del_user() {
   require_runtime || return 1
 
   echo "=== 删除用户 ==="
-  list_user || true
+  list_user
   echo
   read -r -p "请输入要删除的 UUID 或备注: " key
   if [ -z "$key" ]; then
@@ -1219,14 +1415,27 @@ uninstall() {
   esac
 
   echo "==> 停止 Xray 服务"
-  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-  rm -f "$SERVICE_FILE"
-  systemctl daemon-reload
+  if ! command -v systemctl >/dev/null 2>&1; then
+    err "当前系统没有 systemctl，无法安全卸载服务"
+    return 1
+  fi
+  if systemctl is-active --quiet "$SERVICE_NAME" && ! systemctl stop "$SERVICE_NAME"; then
+    err "无法停止 Xray 服务，已取消卸载"
+    return 1
+  fi
+  if systemctl is-enabled --quiet "$SERVICE_NAME" && ! systemctl disable "$SERVICE_NAME"; then
+    err "无法禁用 Xray 服务，已取消卸载"
+    return 1
+  fi
+  rm -f "$SERVICE_FILE" || return 1
+  systemctl daemon-reload || {
+    err "systemd 重新加载失败，已取消删除 Xray 文件"
+    return 1
+  }
 
   echo "==> 删除 Xray 文件"
-  rm -rf "$XRAY_DIR"
-  rm -f "$INFO_FILE" "$XRAY_ENV_FILE" "$XUSER_SCRIPT"
+  rm -rf -- "$XRAY_DIR" || return 1
+  rm -f -- "$INFO_FILE" "$XRAY_ENV_FILE" "$XUSER_SCRIPT"
 
   echo "[OK] 已完全卸载 Xray"
 }
@@ -1272,7 +1481,7 @@ done
 EOFXUSER
   } > "$XUSER_SCRIPT"
 
-  chmod +x "$XUSER_SCRIPT"
+  chmod 0700 "$XUSER_SCRIPT"
 }
 
 echo "========== Xray VLESS 自动部署脚本 =========="
@@ -1307,7 +1516,7 @@ prepare_xray_zip
 install_xray
 
 echo "==> Xray 版本确认"
-detect_installed_xray_version
+detect_candidate_xray_version
 
 log "生成 Xray 配置"
 echo "    域名: $DOMAIN"
@@ -1317,10 +1526,21 @@ echo "    私钥: $KEY_FILE"
 echo "    Xray 目录: $XRAY_DIR"
 write_xray_config
 test_xray_config
+if ! commit_xray_config; then
+  rollback_deployment || err "自动回滚未能完整完成，请检查备份文件"
+  die "写入 Xray 配置失败"
+fi
+if ! commit_xray_install; then
+  rollback_deployment || err "自动回滚未能完整完成，请检查备份文件"
+  die "安装 Xray 文件失败"
+fi
 
 log "写入 systemd 服务"
-write_systemd_service
-restart_service
+if ! write_systemd_service; then
+  rollback_deployment || err "自动回滚未能完整完成，请检查备份文件"
+  die "写入 systemd 服务失败"
+fi
+restart_service || die "Xray 服务启动失败"
 
 write_info_file
 write_env_file
