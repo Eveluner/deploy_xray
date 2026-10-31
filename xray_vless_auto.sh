@@ -1,28 +1,78 @@
 #!/bin/bash
-set -e
+set -Eeuo pipefail
+set +H
+umask 077
 
-# 配置文件路径
-CONFIG_FILE_PATH="${1:-/root/xray_install.conf}"
+DEFAULT_CONFIG_FILE="/root/xray_install.conf"
+DEFAULT_VLESS_FLOW="xtls-rprx-vision"
+DEFAULT_SERVICE_NAME="xray"
 
-# 配置文件处理函数
-load_config() {
-  if [ -f "$CONFIG_FILE_PATH" ]; then
-    echo "[OK] 检测到配置文件: $CONFIG_FILE_PATH"
-    source "$CONFIG_FILE_PATH"
-    return 0
-  else
-    return 1
+CONFIG_FILE_PATH="${1:-$DEFAULT_CONFIG_FILE}"
+TMP_DIR=""
+
+cleanup() {
+  if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
+
+die() {
+  echo "[ERR] $*" >&2
+  exit 1
+}
+
+ok() {
+  echo "[OK] $*"
+}
+
+log() {
+  echo "==> $*"
+}
+
+ensure_parent_dir() {
+  local path="$1"
+  local dir
+  dir="$(dirname "$path")"
+  mkdir -p "$dir"
+}
+
+backup_file() {
+  local file="$1"
+  local backup
+
+  [ -f "$file" ] || return 0
+  backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a "$file" "$backup"
+  chmod 600 "$backup"
+  ok "已备份: $backup"
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    die "请使用 root 用户运行此脚本"
   fi
 }
 
-# 生成配置文件模板
+load_config() {
+  if [ -f "$CONFIG_FILE_PATH" ]; then
+    ok "检测到配置文件: $CONFIG_FILE_PATH"
+    # 配置文件采用 shell 变量格式，只从可信路径加载。
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE_PATH"
+    return 0
+  fi
+
+  return 1
+}
+
 generate_config_template() {
   local template_path="$CONFIG_FILE_PATH"
-  mkdir -p "$(dirname "$template_path")"
-  
+
+  ensure_parent_dir "$template_path"
   cat > "$template_path" << 'CONFIGEOF'
 # Xray 自动安装配置文件
-# 请填写以下参数，留空的字段将使用默认值
+# 配置文件采用 shell 变量格式，请只保存到可信路径。
 
 # 必填项
 DOMAIN="example.com"
@@ -30,579 +80,1258 @@ PORT="443"
 CERT_FILE="/path/to/cert.pem"
 KEY_FILE="/path/to/key.pem"
 
-# 可选项（默认值已预设）
+# 可选项
 XRAY_DIR="/root/xray"
-XRAY_VERSION="26.1.23"
+# XRAY_VERSION 会从安装后的 Xray 二进制自动识别，无需手动设置。
+XRAY_ARCH="auto"
 VLESS_FLOW="xtls-rprx-vision"
 INITIAL_REMARK="初始用户"
 
-# 下载方式：1=GitHub推荐版本, 2=自定义URL, 3=本地文件
+# 下载方式：1=GitHub 最新版, 2=用户指定下载链接, 3=本地 zip 文件
 INSTALL_SOURCE="1"
-XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip"
+XRAY_URL=""
 XRAY_ZIP_LOCAL=""
 
-# 信息文件保存路径
+# 文件保存路径
 INFO_FILE="/root/xray_info.txt"
 XUSER_SCRIPT="/root/xuser.sh"
+XRAY_ENV_FILE="/root/.xray_env"
+SYSTEMD_DIR="/etc/systemd/system"
+SERVICE_NAME="xray"
 CONFIGEOF
 
-  echo "[OK] 已生成配置文件模板: $template_path"
+  ok "已生成配置文件模板: $template_path"
   echo "请编辑配置文件并填写参数后，再次运行本脚本"
-  echo ""
+  echo
   echo "关键参数说明:"
-  echo "  DOMAIN        - 服务器域名（必填）"
-  echo "  PORT          - 监听端口（必填）"
+  echo "  DOMAIN        - 服务器域名（必填，不能保留 example.com）"
+  echo "  PORT          - 监听端口（必填，1-65535）"
   echo "  CERT_FILE     - SSL 证书文件路径（必填）"
   echo "  KEY_FILE      - SSL 私钥文件路径（必填）"
-  echo ""
+  echo "  INSTALL_SOURCE - 1=GitHub 最新版, 2=用户指定下载链接, 3=本地 zip 文件"
+  echo "  XRAY_URL      - INSTALL_SOURCE=2 时填写下载链接"
+  echo "  XRAY_ZIP_LOCAL- INSTALL_SOURCE=3 时填写本地 zip 文件路径"
+  echo "  XRAY_ARCH     - auto/64/arm64-v8a/arm32-v7a 等 release 架构名"
+  echo
 }
 
-echo "========== Xray VLESS 自动部署脚本 =========="
+normalize_config() {
+  DOMAIN="${DOMAIN:-}"
+  PORT="${PORT:-}"
+  CERT_FILE="${CERT_FILE:-}"
+  KEY_FILE="${KEY_FILE:-}"
 
-# 检查是否需要交互式配置
-if [ ! -f "$CONFIG_FILE_PATH" ]; then
-  echo "==> 首次运行，需要配置"
-  read -p "请输入配置文件保存路径 [默认 $CONFIG_FILE_PATH]: " custom_path
-  if [ -n "$custom_path" ]; then
-    CONFIG_FILE_PATH="$custom_path"
+  XRAY_DIR="${XRAY_DIR:-/root/xray}"
+  XRAY_VERSION=""
+  XRAY_ARCH="${XRAY_ARCH:-auto}"
+  VLESS_FLOW="${VLESS_FLOW:-$DEFAULT_VLESS_FLOW}"
+  INITIAL_REMARK="${INITIAL_REMARK:-初始用户}"
+
+  INSTALL_SOURCE="${INSTALL_SOURCE:-1}"
+  # Earlier templates used 4 for GitHub latest; keep those configurations working.
+  if [ "$INSTALL_SOURCE" = "4" ]; then
+    INSTALL_SOURCE="1"
   fi
-  
-  generate_config_template
-  exit 0
-fi
+  XRAY_URL="${XRAY_URL:-}"
+  XRAY_ZIP_LOCAL="${XRAY_ZIP_LOCAL:-}"
 
-# 尝试加载配置
-if ! load_config; then
-  generate_config_template
-  exit 0
-fi
+  INFO_FILE="${INFO_FILE:-/root/xray_info.txt}"
+  XUSER_SCRIPT="${XUSER_SCRIPT:-/root/xuser.sh}"
+  XRAY_ENV_FILE="${XRAY_ENV_FILE:-/root/.xray_env}"
+  SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+  SYSTEMD_DIR="${SYSTEMD_DIR%/}"
+  SERVICE_NAME="${SERVICE_NAME:-$DEFAULT_SERVICE_NAME}"
 
-# 验证必填配置
-if [ -z "$DOMAIN" ] || [ -z "$PORT" ] || [ -z "$CERT_FILE" ] || [ -z "$KEY_FILE" ]; then
-  echo "[ERR] 配置文件中缺少必填参数"
-  echo "请编辑 $CONFIG_FILE_PATH 并填写以下必填项:"
-  echo "  - DOMAIN: 服务器域名"
-  echo "  - PORT: 监听端口"
-  echo "  - CERT_FILE: 证书路径"
-  echo "  - KEY_FILE: 私钥路径"
-  exit 1
-fi
+  CONFIG_FILE="$XRAY_DIR/config.json"
+  XRAY_BIN="$XRAY_DIR/xray"
+  SERVICE_FILE="$SYSTEMD_DIR/${SERVICE_NAME}.service"
+}
 
-# 使用配置中的值覆盖默认值
-XRAY_DIR="${XRAY_DIR:-/root/xray}"
-INFO_FILE="${INFO_FILE:-/root/xray_info.txt}"
-XUSER_SCRIPT="${XUSER_SCRIPT:-/root/xuser.sh}"
+contains_newline() {
+  local value="$1"
+  [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]
+}
 
-### 0. 环境 & 依赖检查
-echo "==> 检测运行环境"
+validate_path_value() {
+  local name="$1"
+  local value="$2"
 
-if ! command -v systemctl >/dev/null 2>&1; then
-  echo "[ERR] 当前系统不支持 systemd"
-  exit 1
-fi
+  [ -n "$value" ] || die "$name 不能为空"
+  if contains_newline "$value"; then
+    die "$name 不能包含换行符"
+  fi
+}
+
+validate_xray_dir() {
+  validate_path_value "XRAY_DIR" "$XRAY_DIR"
+
+  case "$XRAY_DIR" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      die "XRAY_DIR 指向高风险系统目录: $XRAY_DIR"
+      ;;
+  esac
+}
+
+validate_config() {
+  [ -n "$DOMAIN" ] || die "配置文件中缺少 DOMAIN"
+  [ "$DOMAIN" != "example.com" ] || die "请先把 DOMAIN 从 example.com 改为真实域名"
+  [ -n "$PORT" ] || die "配置文件中缺少 PORT"
+  [ -n "$CERT_FILE" ] || die "配置文件中缺少 CERT_FILE"
+  [ -n "$KEY_FILE" ] || die "配置文件中缺少 KEY_FILE"
+
+  if [ "${#DOMAIN}" -gt 253 ] ||
+    ! [[ "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$ ]]; then
+    die "DOMAIN 必须是有效的 DNS 主机名，且每个标签不能以连字符开头或结尾"
+  fi
+  if contains_newline "$DOMAIN"; then
+    die "DOMAIN 不能包含换行符"
+  fi
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die "PORT 必须是 1-65535 之间的数字"
+  fi
+  if ! [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
+    die "SERVICE_NAME 只能包含字母、数字、点、下划线、@ 和连字符"
+  fi
+
+  validate_xray_dir
+  validate_path_value "CERT_FILE" "$CERT_FILE"
+  validate_path_value "KEY_FILE" "$KEY_FILE"
+  validate_path_value "INFO_FILE" "$INFO_FILE"
+  validate_path_value "XUSER_SCRIPT" "$XUSER_SCRIPT"
+  validate_path_value "XRAY_ENV_FILE" "$XRAY_ENV_FILE"
+  validate_path_value "SYSTEMD_DIR" "$SYSTEMD_DIR"
+
+  [ -f "$CERT_FILE" ] || die "证书文件不存在: $CERT_FILE"
+  [ -r "$CERT_FILE" ] || die "证书文件不可读: $CERT_FILE"
+  [ -f "$KEY_FILE" ] || die "私钥文件不存在: $KEY_FILE"
+  [ -r "$KEY_FILE" ] || die "私钥文件不可读: $KEY_FILE"
+
+  case "$INSTALL_SOURCE" in
+    1) ;;
+    2)
+      [ -n "$XRAY_URL" ] || die "INSTALL_SOURCE=2 时必须填写 XRAY_URL"
+      ;;
+    3)
+      [ -n "$XRAY_ZIP_LOCAL" ] || die "INSTALL_SOURCE=3 时必须填写 XRAY_ZIP_LOCAL"
+      [ -f "$XRAY_ZIP_LOCAL" ] || die "本地压缩文件不存在: $XRAY_ZIP_LOCAL"
+      [ -r "$XRAY_ZIP_LOCAL" ] || die "本地压缩文件不可读: $XRAY_ZIP_LOCAL"
+      ;;
+    *)
+      die "INSTALL_SOURCE 只能是 1、2 或 3"
+      ;;
+  esac
+}
 
 install_pkg() {
-  if command -v apt >/dev/null 2>&1; then
-    apt update -y
-    apt install -y "$@"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y "$@"
   elif command -v yum >/dev/null 2>&1; then
     yum install -y "$@"
   else
-    echo "[ERR] 不支持的包管理器"
-    exit 1
+    die "不支持的包管理器，请手动安装依赖: $*"
   fi
 }
 
-for pkg in curl unzip; do
-  if ! command -v $pkg >/dev/null 2>&1; then
-    echo "==> 安装依赖: $pkg"
-    install_pkg $pkg
+ensure_dependencies() {
+  local missing=()
+  local pkg
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    die "当前系统不支持 systemd"
   fi
-done
 
-### 1. 选择 Xray 来源
-echo
-echo "==> 下载和安装 Xray"
+  for pkg in curl unzip python3; do
+    if ! command -v "$pkg" >/dev/null 2>&1; then
+      missing+=("$pkg")
+    fi
+  done
 
-# 如果使用配置文件，直接使用配置中的安装源
-if [ "$INSTALL_SOURCE" = "1" ]; then
-  XRAY_URL="${XRAY_URL:-https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip}"
-  echo "==> 下载 Xray 26.1.23"
-elif [ "$INSTALL_SOURCE" = "2" ]; then
-  XRAY_URL="${XRAY_URL:-https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip}"
-  echo "==> 使用自定义 URL: $XRAY_URL"
-elif [ "$INSTALL_SOURCE" = "3" ]; then
-  if [ -z "$XRAY_ZIP_LOCAL" ]; then
-    echo "[ERR] 配置文件中未指定本地压缩文件路径"
-    exit 1
+  if [ "${#missing[@]}" -gt 0 ]; then
+    log "安装依赖: ${missing[*]}"
+    install_pkg "${missing[@]}"
   fi
-  echo "==> 使用本地文件: $XRAY_ZIP_LOCAL"
-else
-  echo "[ERR] 未知的安装源设置"
-  exit 1
-fi
+}
 
-TMP_DIR="/tmp/xray_install"
-mkdir -p $TMP_DIR
-cd $TMP_DIR
+detect_xray_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      echo "64"
+      ;;
+    aarch64|arm64)
+      echo "arm64-v8a"
+      ;;
+    armv7l|armv7*)
+      echo "arm32-v7a"
+      ;;
+    armv6l|armv6*)
+      echo "arm32-v6"
+      ;;
+    i386|i686)
+      echo "32"
+      ;;
+    *)
+      die "无法自动识别架构，请在配置文件中设置 XRAY_ARCH"
+      ;;
+  esac
+}
 
-if [ "$INSTALL_SOURCE" = "3" ]; then
-  cp "$XRAY_ZIP_LOCAL" xray.zip
-else
-  curl -L -o xray.zip "$XRAY_URL"
-fi
+get_latest_xray_version() {
+  local tag
 
-### 2. 安装位置
-mkdir -p "$XRAY_DIR"
-unzip -o xray.zip -d "$XRAY_DIR"
-chmod +x "$XRAY_DIR/xray"
+  tag="$(curl --fail --location --retry 3 --connect-timeout 15 --silent \
+    "https://api.github.com/repos/XTLS/Xray-core/releases/latest" |
+    python3 -c 'import json, re, sys; tag=json.load(sys.stdin).get("tag_name", ""); print(tag if re.fullmatch(r"v?[0-9]+(\.[0-9]+){2}([.-][A-Za-z0-9.-]+)?", tag) else "")')" \
+    || die "无法获取 Xray 最新版本"
+  [ -n "$tag" ] || die "GitHub 返回的 Xray 版本号无效"
+  printf '%s\n' "${tag#v}"
+}
 
-echo "==> Xray 版本确认"
-"$XRAY_DIR/xray" version
+resolve_xray_source() {
+  local arch
 
-### 3. 生成配置（UUID 自动生成）
-UUID=$("$XRAY_DIR/xray" uuid)
+  case "$INSTALL_SOURCE" in
+    1)
+      XRAY_VERSION="$(get_latest_xray_version)"
+      arch="$XRAY_ARCH"
+      if [ "$arch" = "auto" ]; then
+        arch="$(detect_xray_arch)"
+      fi
+      XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${arch}.zip"
+      log "从 GitHub 下载最新版 Xray ${XRAY_VERSION} (${arch})"
+      ;;
+    2)
+      log "从用户指定链接下载 Xray: $XRAY_URL"
+      ;;
+    3)
+      log "从本地 zip 文件安装 Xray: $XRAY_ZIP_LOCAL"
+      ;;
+  esac
+}
 
-# 从配置文件读取参数（已在开始时加载）
-# PORT、DOMAIN、CERT、KEY 已从配置文件读取
-CERT="$CERT_FILE"
-KEY="$KEY_FILE"
+prepare_xray_zip() {
+  TMP_DIR="$(mktemp -d /tmp/xray_install.XXXXXX)"
 
-# 检查证书和密钥文件是否存在
-if [ ! -f "$CERT" ]; then
-  echo "[ERR] 证书文件不存在: $CERT"
-  exit 1
-fi
-if [ ! -f "$KEY" ]; then
-  echo "[ERR] 私钥文件不存在: $KEY"
-  exit 1
-fi
+  if [ "$INSTALL_SOURCE" = "3" ]; then
+    cp "$XRAY_ZIP_LOCAL" "$TMP_DIR/xray.zip"
+  else
+    curl --fail --location --retry 3 --connect-timeout 15 --output "$TMP_DIR/xray.zip" "$XRAY_URL"
+  fi
+}
 
-CONFIG_FILE="$XRAY_DIR/config.json"
+install_xray() {
+  local unpack_dir="$TMP_DIR/unpacked"
+  local data_file
 
-echo "==> 使用配置参数:"
-echo "    域名: $DOMAIN"
-echo "    端口: $PORT"
-echo "    证书: $CERT"
-echo "    私钥: $KEY"
-echo "    Xray 目录: $XRAY_DIR"
-echo ""
+  mkdir -p "$unpack_dir" "$XRAY_DIR"
+  unzip -oq "$TMP_DIR/xray.zip" -d "$unpack_dir"
 
-cat > "$CONFIG_FILE" << EOF
-{
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "tag": "vless-vision",
-      "listen": "0.0.0.0",
-      "port": $PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "xtls-rprx-vision",
-            "email": "初始用户"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "$DOMAIN",
-          "certificates": [
-            {
-              "certificateFile": "$CERT",
-              "keyFile": "$KEY"
-            }
-          ],
-          "minVersion": "1.3",
-          "cipherSuites": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
-          "alpn": ["h2"],
-          "preferServerCipherSuites": false,
-          "rejectUnknownSni": false
+  [ -f "$unpack_dir/xray" ] || die "压缩包中未找到 xray 可执行文件"
+  install -m 0755 "$unpack_dir/xray" "$XRAY_BIN"
+
+  for data_file in geoip.dat geosite.dat; do
+    if [ -f "$unpack_dir/$data_file" ]; then
+      install -m 0644 "$unpack_dir/$data_file" "$XRAY_DIR/$data_file"
+    fi
+  done
+}
+
+detect_installed_xray_version() {
+  local version_output
+
+  version_output="$("$XRAY_BIN" version)" || die "无法读取已安装的 Xray 版本"
+  XRAY_VERSION="$(printf '%s\n' "$version_output" | awk 'NR == 1 && $1 == "Xray" { print $2 }')"
+  [ -n "$XRAY_VERSION" ] || die "无法从 Xray 版本信息中识别版本号"
+  printf '%s\n' "$version_output"
+}
+
+write_xray_config() {
+  local new_uuid
+
+  new_uuid="$("$XRAY_BIN" uuid)"
+
+  ensure_parent_dir "$CONFIG_FILE"
+  backup_file "$CONFIG_FILE"
+
+  CONFIG_FILE_OUT="$CONFIG_FILE" \
+  DOMAIN_VALUE="$DOMAIN" \
+  PORT_VALUE="$PORT" \
+  CERT_VALUE="$CERT_FILE" \
+  KEY_VALUE="$KEY_FILE" \
+  UUID_VALUE="$new_uuid" \
+  FLOW_VALUE="$VLESS_FLOW" \
+  REMARK_VALUE="$INITIAL_REMARK" \
+  python3 - <<'PY'
+import json
+import os
+import tempfile
+
+path = os.environ["CONFIG_FILE_OUT"]
+flow = os.environ["FLOW_VALUE"]
+clients = []
+
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            old_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"[ERR] 无法读取现有配置，拒绝覆盖: {exc}")
+
+    if not isinstance(old_config, dict):
+        raise SystemExit("[ERR] 现有配置格式无效，拒绝覆盖")
+    inbounds = old_config.get("inbounds", [])
+    if not isinstance(inbounds, list):
+        raise SystemExit("[ERR] 现有配置中的 inbounds 格式无效，拒绝覆盖")
+    if inbounds:
+        first_inbound = inbounds[0]
+        if not isinstance(first_inbound, dict):
+            raise SystemExit("[ERR] 现有配置中的 inbound 格式无效，拒绝覆盖")
+        settings = first_inbound.get("settings", {})
+        if not isinstance(settings, dict):
+            raise SystemExit("[ERR] 现有配置中的 settings 格式无效，拒绝覆盖")
+        old_clients = settings.get("clients", [])
+        if not isinstance(old_clients, list):
+            raise SystemExit("[ERR] 现有配置中的 clients 格式无效，拒绝覆盖")
+        clients = old_clients
+
+if clients:
+    for client in clients:
+        if isinstance(client, dict) and flow and "flow" not in client:
+            client["flow"] = flow
+else:
+    client = {
+        "id": os.environ["UUID_VALUE"],
+        "email": os.environ["REMARK_VALUE"],
+    }
+    if flow:
+        client["flow"] = flow
+    clients = [client]
+
+config = {
+    "log": {
+        "loglevel": "warning",
+    },
+    "inbounds": [
+        {
+            "tag": "vless-vision",
+            "listen": "0.0.0.0",
+            "port": int(os.environ["PORT_VALUE"]),
+            "protocol": "vless",
+            "settings": {
+                "clients": clients,
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": os.environ["DOMAIN_VALUE"],
+                    "certificates": [
+                        {
+                            "certificateFile": os.environ["CERT_VALUE"],
+                            "keyFile": os.environ["KEY_VALUE"],
+                        },
+                    ],
+                    "minVersion": "1.3",
+                    "cipherSuites": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
+                    "alpn": ["h2"],
+                    "preferServerCipherSuites": False,
+                    "rejectUnknownSni": True,
+                },
+                "sockopt": {
+                    "tcpFastOpen": True,
+                    "tcpKeepAliveIdle": 60,
+                    "tcpNoDelay": True,
+                },
+            },
         },
-        "sockopt": {
-          "tcpFastOpen": true,
-          "tcpKeepAliveIdle": 60,
-          "tcpNoDelay": true
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    }
-  ]
+    ],
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "settings": {},
+        },
+    ],
 }
-EOF
 
-### 4. 配置检查
-echo "==> 校验配置文件"
-"$XRAY_DIR/xray" run -test -config "$CONFIG_FILE"
+directory = os.path.dirname(path) or "."
+fd, temp_path = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, path)
+except Exception:
+    try:
+        os.unlink(temp_path)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+  chmod 600 "$CONFIG_FILE"
+}
 
-### 5. systemd 服务
-SERVICE_FILE="/etc/systemd/system/xray.service"
+test_xray_config() {
+  log "校验配置文件"
+  "$XRAY_BIN" run -test -config "$CONFIG_FILE"
+}
 
-cat > "$SERVICE_FILE" << EOF
+write_systemd_service() {
+  ensure_parent_dir "$SERVICE_FILE"
+  backup_file "$SERVICE_FILE"
+
+  cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Xray Service
 Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
-ExecStart=$XRAY_DIR/xray run -config $CONFIG_FILE
+Type=simple
+ExecStart="$XRAY_BIN" run -config "$CONFIG_FILE"
 Restart=on-failure
 RestartSec=10
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
-systemctl daemon-reload
-systemctl enable xray
-systemctl restart xray
+restart_service() {
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME"
+  systemctl restart "$SERVICE_NAME"
+}
 
-### 6. 生成链接并保存
-# 使用备注作为链接名字
-INITIAL_REMARK="${INITIAL_REMARK:-初始用户}"
-# encode spaces in remark for URI fragment
-REMARK_ESCAPED="${INITIAL_REMARK// /%20}"
-VLESS_LINK="vless://$UUID@$DOMAIN:$PORT?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=$DOMAIN#$REMARK_ESCAPED"
+write_info_file() {
+  ensure_parent_dir "$INFO_FILE"
+  VLESS_LINK="$(
+    python3 - "$CONFIG_FILE" "$INFO_FILE" "$XRAY_DIR" "$XRAY_VERSION" "$DOMAIN" "$PORT" "$VLESS_FLOW" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from urllib.parse import quote, urlencode
 
-cat > "$INFO_FILE" << EOF
-Xray 安装目录: $XRAY_DIR
-Xray 版本: ${XRAY_VERSION:-26.1.23}
-域名: $DOMAIN
-端口: $PORT
+config_file, info_file, xray_dir, version, domain, port, default_flow = sys.argv[1:8]
 
-VLESS 连接信息:
-================
+def make_link(uuid, remark, flow, alpn):
+    params = [("encryption", "none")]
+    if flow:
+        params.append(("flow", flow))
+    params.extend([
+        ("security", "tls"),
+        ("type", "tcp"),
+        ("sni", domain),
+    ])
+    if alpn:
+        params.append(("alpn", alpn))
+    return f"vless://{uuid}@{domain}:{port}?{urlencode(params)}#{quote(remark, safe='')}"
 
-备注: $INITIAL_REMARK
-UUID: $UUID
-VLESS 链接: $VLESS_LINK
-EOF
+with open(config_file, "r", encoding="utf-8") as f:
+    config = json.load(f)
 
-echo
-echo "========== 部署完成 =========="
-echo "$VLESS_LINK"
-echo "已保存到: $INFO_FILE"
+inbound = config.get("inbounds", [{}])[0]
+stream_settings = inbound.get("streamSettings", {})
+tls_settings = stream_settings.get("tlsSettings", {})
+domain = tls_settings.get("serverName") or domain
+port = str(inbound.get("port") or port)
+alpn = tls_settings.get("alpn", [])
+if isinstance(alpn, list):
+    alpn = ",".join(alpn)
+elif not isinstance(alpn, str):
+    alpn = ""
+clients = inbound.get("settings", {}).get("clients", [])
+first_link = ""
 
-### 7. 生成 xuser.sh（用户管理脚本）
+os.makedirs(os.path.dirname(info_file) or ".", exist_ok=True)
+info_dir = os.path.dirname(info_file) or "."
+fd, temp_path = tempfile.mkstemp(prefix=".xray_info.", dir=info_dir)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"Xray 安装目录: {xray_dir}\n")
+        f.write(f"Xray 版本: {version}\n")
+        f.write(f"域名: {domain}\n")
+        f.write(f"端口: {port}\n\n")
+        f.write("VLESS 连接信息:\n")
+        f.write("================\n\n")
+        for client in clients:
+            uuid = client.get("id", "")
+            remark = client.get("email", "未命名用户")
+            flow = client.get("flow", default_flow)
+            link = make_link(uuid, remark, flow, alpn)
+            if not first_link:
+                first_link = link
+            f.write(f"备注: {remark}\n")
+            f.write(f"UUID: {uuid}\n")
+            f.write(f"VLESS 链接: {link}\n\n")
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, info_file)
+except Exception:
+    try:
+        os.unlink(temp_path)
+    except FileNotFoundError:
+        pass
+    raise
 
-cat > "$XUSER_SCRIPT" << 'EOFXUSER'
-#!/bin/bash
-set -e
-set +H
+print(first_link)
+PY
+  )"
+  chmod 600 "$INFO_FILE"
+}
 
-# ==========================
-# Xray 用户管理脚本 xuser.sh
-# ==========================
+write_env_file() {
+  ensure_parent_dir "$XRAY_ENV_FILE"
+  {
+    printf 'export XRAY_DIR=%q\n' "$XRAY_DIR"
+    printf 'export CONFIG_FILE=%q\n' "$CONFIG_FILE"
+    printf 'export BIN=%q\n' "$XRAY_BIN"
+    printf 'export INFO_FILE=%q\n' "$INFO_FILE"
+    printf 'export XUSER_SCRIPT=%q\n' "$XUSER_SCRIPT"
+    printf 'export XRAY_VERSION=%q\n' "$XRAY_VERSION"
+    printf 'export XRAY_ARCH=%q\n' "$XRAY_ARCH"
+    printf 'export VLESS_FLOW=%q\n' "$VLESS_FLOW"
+    printf 'export SYSTEMD_DIR=%q\n' "$SYSTEMD_DIR"
+    printf 'export SERVICE_NAME=%q\n' "$SERVICE_NAME"
+    printf 'export DOMAIN=%q\n' "$DOMAIN"
+    printf 'export PORT=%q\n' "$PORT"
+  } > "$XRAY_ENV_FILE"
+  chmod 600 "$XRAY_ENV_FILE"
+}
+
+generate_xuser_script() {
+  ensure_parent_dir "$XUSER_SCRIPT"
+
+  {
+    printf '#!/bin/bash\n'
+    printf 'set -Eeuo pipefail\n'
+    printf 'set +H\n\n'
+    printf 'umask 077\n\n'
+    printf 'XRAY_ENV_FILE=%q\n\n' "$XRAY_ENV_FILE"
+    cat <<'EOFXUSER'
+
+if [ -r "$XRAY_ENV_FILE" ]; then
+  # shellcheck source=/dev/null
+  source "$XRAY_ENV_FILE"
+fi
 
 XRAY_DIR="${XRAY_DIR:-/root/xray}"
 CONFIG_FILE="${CONFIG_FILE:-$XRAY_DIR/config.json}"
 BIN="${BIN:-$XRAY_DIR/xray}"
 INFO_FILE="${INFO_FILE:-/root/xray_info.txt}"
+XUSER_SCRIPT="${XUSER_SCRIPT:-/root/xuser.sh}"
+XRAY_VERSION="${XRAY_VERSION:-unknown}"
+XRAY_ARCH="${XRAY_ARCH:-auto}"
+VLESS_FLOW="${VLESS_FLOW:-xtls-rprx-vision}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+SYSTEMD_DIR="${SYSTEMD_DIR%/}"
+SERVICE_NAME="${SERVICE_NAME:-xray}"
+SERVICE_FILE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+DOMAIN="${DOMAIN:-}"
+PORT="${PORT:-}"
 
-# 从 xray_info.txt 获取 domain 和 port
-get_domain() { 
-  grep "^域名:" "$INFO_FILE" 2>/dev/null | tail -1 | awk -F": " '{print $2}' || echo ""
+err() {
+  echo "[ERR] $*" >&2
 }
 
-get_port() { 
-  grep "^端口:" "$INFO_FILE" 2>/dev/null | tail -1 | awk -F": " '{print $2}' || echo ""
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    err "请使用 root 用户运行此操作"
+    return 1
+  fi
 }
 
-# 从 xray_info.txt 获取 Xray 安装目录
-get_xray_dir() {
-  grep "^Xray 安装目录:" "$INFO_FILE" 2>/dev/null | tail -1 | awk -F": " '{print $2}' || echo "/root/xray"
+require_runtime() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    err "缺少 python3"
+    return 1
+  fi
+  if [ ! -x "$BIN" ]; then
+    err "找不到 Xray 可执行文件: $BIN"
+    return 1
+  fi
+  if [ ! -f "$CONFIG_FILE" ]; then
+    err "找不到配置文件: $CONFIG_FILE"
+    return 1
+  fi
 }
 
-# 更新 xray_info.txt 文件
+get_info_value() {
+  local key="$1"
+
+  [ -f "$INFO_FILE" ] || return 0
+  awk -F': ' -v key="$key" '
+    index($0, key ":") == 1 {
+      sub("^[^:]*: ?", "")
+      value=$0
+    }
+    END { print value }
+  ' "$INFO_FILE"
+}
+
+current_domain() {
+  local value
+
+  if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
+    value="$(python3 - "$CONFIG_FILE" 2>/dev/null <<'PY' || true
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+inbounds = config.get("inbounds", [])
+if inbounds:
+    print(inbounds[0].get("streamSettings", {}).get("tlsSettings", {}).get("serverName") or "")
+PY
+    )"
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  fi
+
+  if [ -n "${DOMAIN:-}" ]; then
+    printf '%s\n' "$DOMAIN"
+  else
+    get_info_value "域名"
+  fi
+}
+
+current_port() {
+  local value
+
+  if [ -f "$CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
+    value="$(python3 - "$CONFIG_FILE" 2>/dev/null <<'PY' || true
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+inbounds = config.get("inbounds", [])
+if inbounds:
+    print(inbounds[0].get("port") or "")
+PY
+    )"
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  fi
+
+  if [ -n "${PORT:-}" ]; then
+    printf '%s\n' "$PORT"
+  else
+    get_info_value "端口"
+  fi
+}
+
+make_backup() {
+  local dir
+  local backup
+
+  dir="$(dirname "$CONFIG_FILE")"
+  backup="$(mktemp "$dir/.config.json.bak.XXXXXX")"
+  cp -a "$CONFIG_FILE" "$backup"
+  chmod 600 "$backup"
+  printf '%s\n' "$backup"
+}
+
+restore_backup() {
+  local backup="$1"
+
+  cp -a "$backup" "$CONFIG_FILE" && rm -f "$backup"
+}
+
+run_config_test() {
+  "$BIN" run -test -config "$CONFIG_FILE" >/dev/null
+}
+
+restart_xray() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    err "当前系统不支持 systemd"
+    return 1
+  fi
+  systemctl restart "$SERVICE_NAME"
+}
+
+finish_config_change() {
+  local backup="$1"
+
+  if ! run_config_test; then
+    err "配置验证失败，已回滚"
+    restore_backup "$backup" || err "回滚失败，备份保留在: $backup"
+    return 1
+  fi
+
+  if ! update_info; then
+    err "更新用户信息失败，正在回滚"
+    if ! restore_backup "$backup"; then
+      err "回滚失败，备份保留在: $backup"
+      return 1
+    fi
+    update_info || err "回滚后仍无法更新用户信息"
+    return 1
+  fi
+
+  if ! restart_xray; then
+    err "服务重启失败，正在恢复旧配置"
+    if ! restore_backup "$backup"; then
+      err "回滚失败，备份保留在: $backup"
+      return 1
+    fi
+    update_info || {
+      err "已恢复旧配置，但无法恢复用户信息"
+      return 1
+    }
+    restart_xray || {
+      err "旧配置已恢复，但服务重启失败"
+      return 1
+    }
+    return 1
+  fi
+
+  rm -f "$backup"
+}
+
+stop_xray() {
+  require_root || return 1
+  systemctl stop "$SERVICE_NAME" && echo "[OK] Xray 已关闭"
+}
+
+start_xray() {
+  require_root || return 1
+  systemctl start "$SERVICE_NAME" && echo "[OK] Xray 已启动"
+}
+
+show_xray_logs() {
+  if ! command -v journalctl >/dev/null 2>&1; then
+    err "当前系统没有 journalctl"
+    return 1
+  fi
+  journalctl -u "$SERVICE_NAME" -n 100 --no-pager
+}
+
+latest_release_version() {
+  curl --fail --location --retry 3 --connect-timeout 15 --silent \
+    "https://api.github.com/repos/XTLS/Xray-core/releases/latest" |
+    python3 -c 'import json, re, sys; tag=json.load(sys.stdin).get("tag_name", ""); print(tag[1:] if tag.startswith("v") and re.fullmatch(r"v[0-9]+(\.[0-9]+){2}([.-][A-Za-z0-9.-]+)?", tag) else tag if re.fullmatch(r"[0-9]+(\.[0-9]+){2}([.-][A-Za-z0-9.-]+)?", tag) else "")'
+}
+
+update_xray_latest() {
+  local version
+  local arch
+  local update_dir
+  local candidate
+  local backup
+  local replacement
+
+  require_root || return 1
+  require_runtime || return 1
+  for command_name in curl unzip python3; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      err "缺少依赖: $command_name"
+      return 1
+    fi
+  done
+  if ! command -v systemctl >/dev/null 2>&1; then
+    err "当前系统不支持 systemd"
+    return 1
+  fi
+
+  version="$(latest_release_version)" || {
+    err "无法获取 Xray 最新版本"
+    return 1
+  }
+  if [ -z "$version" ]; then
+    err "GitHub 返回的 Xray 版本号无效"
+    return 1
+  fi
+
+  arch="$XRAY_ARCH"
+  if [ "$arch" = "auto" ]; then
+    case "$(uname -m)" in
+      x86_64|amd64) arch="64" ;;
+      aarch64|arm64) arch="arm64-v8a" ;;
+      armv7l|armv7*) arch="arm32-v7a" ;;
+      armv6l|armv6*) arch="arm32-v6" ;;
+      i386|i686) arch="32" ;;
+      *) err "无法自动识别架构，请在环境文件中设置 XRAY_ARCH"; return 1 ;;
+    esac
+  fi
+
+  update_dir="$(mktemp -d /tmp/xray_update.XXXXXX)" || return 1
+  candidate="$update_dir/unpacked/xray"
+  backup="$update_dir/xray.old"
+  replacement="${BIN}.new"
+  if ! curl --fail --location --retry 3 --connect-timeout 15 \
+    --output "$update_dir/xray.zip" \
+    "https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${arch}.zip"; then
+    err "下载 Xray ${version} 失败"
+    rm -rf "$update_dir"
+    return 1
+  fi
+  if ! unzip -oq "$update_dir/xray.zip" -d "$update_dir/unpacked" || [ ! -f "$candidate" ]; then
+    err "最新版压缩包无效或缺少 xray 可执行文件"
+    rm -rf "$update_dir"
+    return 1
+  fi
+  chmod 0755 "$candidate"
+  if ! "$candidate" run -test -config "$CONFIG_FILE"; then
+    err "最新版无法通过当前配置校验，未更新"
+    rm -rf "$update_dir"
+    return 1
+  fi
+
+  cp -a "$BIN" "$backup"
+  if ! systemctl stop "$SERVICE_NAME" || ! install -m 0755 "$candidate" "$replacement" || ! mv -f "$replacement" "$BIN"; then
+    err "替换 Xray 二进制失败"
+    rm -f "$replacement"
+    systemctl start "$SERVICE_NAME" || true
+    rm -rf "$update_dir"
+    return 1
+  fi
+  if ! systemctl start "$SERVICE_NAME"; then
+    err "最新版启动失败，正在恢复旧版本"
+    cp -a "$backup" "$BIN"
+    systemctl start "$SERVICE_NAME" || true
+    rm -rf "$update_dir"
+    return 1
+  fi
+
+  XRAY_VERSION="$version"
+  if [ -f "$XRAY_ENV_FILE" ]; then
+    sed -i "s/^export XRAY_VERSION=.*/export XRAY_VERSION=$(printf '%q' "$version")/" "$XRAY_ENV_FILE"
+  fi
+  update_info || err "Xray 已更新，但更新 xray_info.txt 失败"
+  echo "[OK] Xray 已更新至 ${version} 并启动"
+  rm -rf "$update_dir"
+}
+
 update_info() {
-  DOMAIN="$(get_domain)"
-  PORT="$(get_port)"
-  XRAY_DIR="$(get_xray_dir)"
+  local domain
+  local port
 
-  # 如果 DOMAIN 或 PORT 为空，返回错误
-  if [ -z "$DOMAIN" ] || [ -z "$PORT" ]; then
-    echo "[ERR] 无法从 xray_info.txt 读取域名或端口"
+  require_runtime || return 1
+  domain="$(current_domain)"
+  port="$(current_port)"
+
+  if [ -z "$domain" ] || [ -z "$port" ]; then
+    err "无法读取域名或端口"
     return 1
   fi
 
-  cat > "$INFO_FILE" << EOF
-Xray 安装目录: $XRAY_DIR
-Xray 版本: 26.1.23
-域名: $DOMAIN
-端口: $PORT
+  python3 - "$CONFIG_FILE" "$INFO_FILE" "$XRAY_DIR" "$XRAY_VERSION" "$domain" "$port" "$VLESS_FLOW" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from urllib.parse import quote, urlencode
 
-VLESS 连接信息:
-================
+config_file, info_file, xray_dir, version, domain, port, default_flow = sys.argv[1:8]
 
-EOF
+def clients_from(config):
+    try:
+        clients = config["inbounds"][0]["settings"].get("clients", [])
+    except (KeyError, IndexError, TypeError) as exc:
+        raise SystemExit(f"[ERR] 无法读取 clients: {exc}")
+    if not isinstance(clients, list):
+        raise SystemExit("[ERR] clients 不是数组")
+    return clients
 
-  # 从配置中提取用户信息
-  awk -v domain="$DOMAIN" -v port="$PORT" '
-    /"id":/ { 
-      id=$2; 
-      gsub(/[",]/, "", id);
-      client_id=id;
-    }
-    /"email":/ {
-      # capture everything between the first and last quote after email:
-      match($0, /"email"[[:space:]]*:[[:space:]]*"(.*)"/, arr);
-      email=arr[1];
-      if (client_id != "") {
-        printf "备注: %s\n", email;
-        printf "UUID: %s\n", client_id;
-        # encode spaces in remark for URI fragment
-        remark_enc=email;
-        gsub(/ /, "%20", remark_enc);
-        printf "VLESS 链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, remark_enc;
-        client_id="";
-      }
-    }
-  ' DOMAIN="$DOMAIN" PORT="$PORT" "$CONFIG_FILE" >> "$INFO_FILE"
+def make_link(uuid, remark, flow, alpn):
+    params = [("encryption", "none")]
+    if flow:
+        params.append(("flow", flow))
+    params.extend([
+        ("security", "tls"),
+        ("type", "tcp"),
+        ("sni", domain),
+    ])
+    if alpn:
+        params.append(("alpn", alpn))
+    return f"vless://{uuid}@{domain}:{port}?{urlencode(params)}#{quote(remark, safe='')}"
+
+with open(config_file, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+clients = clients_from(config)
+tls_settings = config.get("inbounds", [{}])[0].get("streamSettings", {}).get("tlsSettings", {})
+alpn = tls_settings.get("alpn", [])
+if isinstance(alpn, list):
+  alpn = ",".join(alpn)
+elif not isinstance(alpn, str):
+  alpn = ""
+os.makedirs(os.path.dirname(info_file) or ".", exist_ok=True)
+
+info_dir = os.path.dirname(info_file) or "."
+fd, temp_path = tempfile.mkstemp(prefix=".xray_info.", dir=info_dir)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"Xray 安装目录: {xray_dir}\n")
+        f.write(f"Xray 版本: {version}\n")
+        f.write(f"域名: {domain}\n")
+        f.write(f"端口: {port}\n\n")
+        f.write("VLESS 连接信息:\n")
+        f.write("================\n\n")
+        for client in clients:
+            uuid = client.get("id", "")
+            remark = client.get("email", "未命名用户")
+            flow = client.get("flow", default_flow)
+            f.write(f"备注: {remark}\n")
+            f.write(f"UUID: {uuid}\n")
+            f.write(f"VLESS 链接: {make_link(uuid, remark, flow, alpn)}\n\n")
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, info_file)
+except Exception:
+    try:
+        os.unlink(temp_path)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+  chmod 600 "$INFO_FILE"
 }
 
-# 添加用户
 add_user() {
-  read -p "请输入用户备注（例如: alice-iphone）: " REMARK
-  if [ -z "$REMARK" ]; then
-    echo "[ERR] 备注不能为空"
+  local remark
+  local uuid
+  local backup
+
+  require_root || return 1
+  require_runtime || return 1
+
+  read -r -p "请输入用户备注（例如: alice-iphone）: " remark
+  if [ -z "$remark" ]; then
+    err "备注不能为空"
     return 1
   fi
 
-  # 检查备注是否已存在
-  if grep -q "\"email\": \"$REMARK\"" "$CONFIG_FILE"; then
-    echo "[ERR] 备注已存在"
+  uuid="$("$BIN" uuid)"
+  backup="$(make_backup)" || return 1
+
+  if ! python3 - "$CONFIG_FILE" "$uuid" "$remark" "$VLESS_FLOW" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+config_file, uuid, remark, flow = sys.argv[1:5]
+
+def save_json(path, data):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+with open(config_file, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+try:
+    clients = config["inbounds"][0]["settings"].setdefault("clients", [])
+except (KeyError, IndexError, TypeError) as exc:
+    raise SystemExit(f"[ERR] 无法读取 clients: {exc}")
+
+if not isinstance(clients, list):
+    raise SystemExit("[ERR] clients 不是数组")
+if any(client.get("email") == remark for client in clients):
+    raise SystemExit("[ERR] 备注已存在")
+
+client = {
+    "id": uuid,
+    "email": remark,
+}
+if flow:
+    client["flow"] = flow
+
+clients.append(client)
+save_json(config_file, config)
+PY
+  then
+    rm -f "$backup"
     return 1
   fi
 
-  # 生成 UUID
-  UUID="$($BIN uuid)"
-
-  # 向 clients 数组中插入新用户
-  # 找到最后一个 client 并在其后添加逗号和新 client
-  sed -i "/\"clients\": \[/a\\          {\n            \"id\": \"$UUID\",\n            \"flow\": \"xtls-rprx-vision\",\n            \"email\": \"$REMARK\"\n          }," "$CONFIG_FILE"
+  finish_config_change "$backup" || return 1
 
   echo "[OK] 添加成功"
-  echo "备注: $REMARK"
-  echo "UUID: $UUID"
-
-  # 验证配置
-  if ! "$BIN" run -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
-    echo "[ERR] 配置验证失败，回滚更改..."
-    git -C "$(dirname $CONFIG_FILE)" checkout "$CONFIG_FILE" 2>/dev/null || true
-    return 1
-  fi
-
-  update_info
-  systemctl restart xray
+  echo "备注: $remark"
+  echo "UUID: $uuid"
   echo "[OK] Xray 已重启"
 }
 
-# 删除用户
 del_user() {
+  local key
+  local backup
+
+  require_root || return 1
+  require_runtime || return 1
+
   echo "=== 删除用户 ==="
-  list_user
+  list_user || true
   echo
-  read -p "请输入要删除的 UUID 或备注: " KEY
-  if [ -z "$KEY" ]; then
+  read -r -p "请输入要删除的 UUID 或备注: " key
+  if [ -z "$key" ]; then
     echo "取消"
     return 0
   fi
 
-  # 检查用户是否存在
-  if ! grep -q "$KEY" "$CONFIG_FILE"; then
-    echo "[ERR] 找不到用户"
+  backup="$(make_backup)" || return 1
+  if ! python3 - "$CONFIG_FILE" "$key" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+config_file, key = sys.argv[1:3]
+
+def save_json(path, data):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+with open(config_file, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+try:
+    clients = config["inbounds"][0]["settings"].get("clients", [])
+except (KeyError, IndexError, TypeError) as exc:
+    raise SystemExit(f"[ERR] 无法读取 clients: {exc}")
+
+new_clients = [
+    client for client in clients
+    if client.get("id") != key and client.get("email") != key
+]
+if len(new_clients) == len(clients):
+    raise SystemExit("[ERR] 找不到用户")
+
+config["inbounds"][0]["settings"]["clients"] = new_clients
+save_json(config_file, config)
+PY
+  then
+    rm -f "$backup"
     return 1
   fi
 
-  # 删除包含该 KEY 的整个 client 对象（多行）
-  # 使用更安全的方式处理多行对象
-  python3 -c "
+  finish_config_change "$backup" || return 1
+  echo "[OK] 删除成功，Xray 已重启"
+}
+
+list_user() {
+  local domain
+  local port
+
+  require_runtime || return 1
+  domain="$(current_domain)"
+  port="$(current_port)"
+
+  if [ -z "$domain" ] || [ -z "$port" ]; then
+    err "无法读取域名或端口"
+    return 1
+  fi
+
+  echo "=== 当前用户列表 ==="
+  python3 - "$CONFIG_FILE" "$domain" "$port" "$VLESS_FLOW" <<'PY'
 import json
 import sys
+from urllib.parse import quote, urlencode
 
-try:
-    with open('$CONFIG_FILE', 'r') as f:
-        config = json.load(f)
-    
-    # 在 clients 中查找并删除
-    original_count = len(config['inbounds'][0]['settings']['clients'])
-    config['inbounds'][0]['settings']['clients'] = [
-        c for c in config['inbounds'][0]['settings']['clients']
-        if c.get('id') != '$KEY' and c.get('email') != '$KEY'
-    ]
-    
-    if len(config['inbounds'][0]['settings']['clients']) == original_count:
-        print('[ERR] 找不到用户')
-        sys.exit(1)
-    
-    with open('$CONFIG_FILE', 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    print('[OK] 删除成功')
-except Exception as e:
-    print(f'[ERR] 错误: {e}')
-    sys.exit(1)
-  " 2>/dev/null || {
-    # 如果 python3 不可用，使用 sed 方法（不安全但能用）
-    sed -i "/\"id\": \"$KEY\"/,/}/d" "$CONFIG_FILE"
-    sed -i "/\"email\": \"$KEY\"/,/}/d" "$CONFIG_FILE"
-    # 清理多余的逗号
-    sed -i ':a;N;$!ba;s/},\n          }/}\n          }/g' "$CONFIG_FILE"
-    # 删除最后一个 client 前的多余逗号（在数组末尾会导致 JSON 无效）
-    sed -i ':a;N;$!ba;s/,\n[[:space:]]*\]/\n]/g' "$CONFIG_FILE"
-    echo "[OK] 删除成功（使用 sed 方式）"
-  }
+config_file, domain, port, default_flow = sys.argv[1:5]
 
-  update_info
-  systemctl restart xray
-  echo "[OK] Xray 已重启"
+def make_link(uuid, remark, flow, alpn):
+    params = [("encryption", "none")]
+    if flow:
+        params.append(("flow", flow))
+    params.extend([
+        ("security", "tls"),
+        ("type", "tcp"),
+        ("sni", domain),
+    ])
+    if alpn:
+        params.append(("alpn", alpn))
+    return f"vless://{uuid}@{domain}:{port}?{urlencode(params)}#{quote(remark, safe='')}"
+
+with open(config_file, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+clients = config.get("inbounds", [{}])[0].get("settings", {}).get("clients", [])
+tls_settings = config.get("inbounds", [{}])[0].get("streamSettings", {}).get("tlsSettings", {})
+alpn = tls_settings.get("alpn", [])
+if isinstance(alpn, list):
+  alpn = ",".join(alpn)
+elif not isinstance(alpn, str):
+  alpn = ""
+if not clients:
+    print("（暂无用户）")
+    raise SystemExit(0)
+
+for index, client in enumerate(clients, 1):
+    remark = client.get("email", "未命名用户")
+    uuid = client.get("id", "")
+    flow = client.get("flow", default_flow)
+    print(f"{index}. 备注: {remark}")
+    print(f"   UUID: {uuid}")
+    print(f"   链接: {make_link(uuid, remark, flow, alpn)}")
+    print()
+PY
 }
 
-# 列出所有用户
-list_user() {
-  echo "=== 当前用户列表 ==="
-  
-  # 获取域名和端口
-  DOMAIN="$(get_domain)"
-  PORT="$(get_port)"
-  
-  if [ -z "$DOMAIN" ] || [ -z "$PORT" ]; then
-    echo "[ERR] 无法获取域名或端口信息"
-    return 1
-  fi
-  
-  if ! grep -q "\"email\":" "$CONFIG_FILE"; then
-    echo "（暂无备注用户）"
-    return 0
-  fi
-
-  python3 -c "
-import json
-try:
-    with open('$CONFIG_FILE', 'r') as f:
-        config = json.load(f)
-    
-    domain = '$DOMAIN'
-    port = '$PORT'
-    
-    import urllib.parse
-    for i, client in enumerate(config['inbounds'][0]['settings']['clients'], 1):
-        email = client.get('email', '(未设置)')
-        uuid = client.get('id', '(未知)')
-        # 生成配置链接，使用备注作为链接名，空格会转换为%%20
-        frag = urllib.parse.quote(email, safe='')
-        vless_link = f'vless://{uuid}@{domain}:{port}?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni={domain}#{frag}'
-        
-        print(f'{i}. 备注: {email}')
-        print(f'   UUID: {uuid}')
-        print(f'   链接: {vless_link}')
-        print()
-except Exception as e:
-    # 如果发生任何异常（例如配置文件 JSON 格式错误），
-    # 直接退出并返回非零状态，让 shell 走到后面的备用解析分支。
-    # 这样可以避免将原始的 Python 错误信息暴露给用户，
-    # 并使用 awk/gawk 来尽可能列出已有的数据。
-    #
-    # 我们不打印 e 的内容，因为它通常包含 JSONDecodeError
-    # 报错，这会让用户误以为脚本本身有 bug。
-    sys.exit(1)
-  " 2>/dev/null || {
-    # 如果 python3 不可用，使用 grep/awk
-    awk -v domain="$DOMAIN" -v port="$PORT" '
-      /"id":/ { 
-        id=\$2; 
-        gsub(/[",]/, "", id);
-        client_id=id;
-      }
-      /"email":/ {
-        match($0, /"email"[[:space:]]*:[[:space:]]*"(.*)"/, arr);
-        email=arr[1];
-        printf "备注: %s\n", email;
-        printf "UUID: %s\n", client_id;
-        remark_enc=email;
-        gsub(/ /, "%20", remark_enc);
-        printf "链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=tls&type=tcp&sni=%s#%s\n\n", client_id, domain, port, domain, remark_enc;
-      }
-    ' "$CONFIG_FILE"
-  }
-}
-
-# 一键卸载
 uninstall() {
-  read -p "[WARN]  确认卸载 Xray？此操作不可恢复 [y/N]: " C
-  [[ "$C" != "y" ]] && { echo "已取消"; return 0; }
+  local confirm
+
+  require_root || return 1
+  case "$XRAY_DIR" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      err "拒绝删除高风险目录: ${XRAY_DIR:-<empty>}"
+      return 1
+      ;;
+  esac
+
+  read -r -p "[WARN] 确认卸载 Xray？此操作不可恢复 [y/N]: " confirm
+  case "$confirm" in
+    y|Y) ;;
+    *) echo "已取消"; return 0 ;;
+  esac
 
   echo "==> 停止 Xray 服务"
-  systemctl stop xray 2>/dev/null || true
-  systemctl disable xray 2>/dev/null || true
-  rm -f /etc/systemd/system/xray.service
+  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+  rm -f "$SERVICE_FILE"
   systemctl daemon-reload
-  
+
   echo "==> 删除 Xray 文件"
   rm -rf "$XRAY_DIR"
-  rm -f "$INFO_FILE"
-  
+  rm -f "$INFO_FILE" "$XRAY_ENV_FILE" "$XUSER_SCRIPT"
+
   echo "[OK] 已完全卸载 Xray"
 }
 
-# 显示菜单
 show_menu() {
   echo
   echo "╔════════════════════════════════════════╗"
   echo "║  Xray 用户管理工具 (xuser.sh)          ║"
   echo "╚════════════════════════════════════════╝"
-  echo "1)  添加用户"
-  echo "2)  删除用户"
-  echo "3)  列出所有用户"
-  echo "4)  更新 xray_info.txt"
-  echo "5)  一键卸载 Xray"
+  echo "1) 添加用户"
+  echo "2) 删除用户"
+  echo "3) 列出所有用户"
+  echo "4) 更新 xray_info.txt"
+  echo "5) 一键卸载 Xray"
+  echo "6) 关闭 Xray"
+  echo "7) 显示 Xray 最近 100 条日志"
+  echo "8) 重启 Xray"
+  echo "9) 启动 Xray"
+  echo "10) 更新 Xray 到最新版"
   echo "0) 退出"
   echo
 }
 
-# 主循环
 while true; do
   show_menu
-  read -p "请选择操作 [0-5]: " CHOICE
+  read -r -p "请选择操作 [0-10]: " choice
 
-  case "$CHOICE" in
+  case "$choice" in
     1) add_user ;;
     2) del_user ;;
     3) list_user ;;
     4) update_info && echo "[OK] xray_info.txt 已更新" ;;
     5) uninstall ;;
+    6) stop_xray ;;
+    7) show_xray_logs ;;
+    8) restart_xray && echo "[OK] Xray 已重启" ;;
+    9) start_xray ;;
+    10) update_xray_latest ;;
     0) echo "退出"; exit 0 ;;
     *) echo "[ERR] 无效选项" ;;
   esac
 done
 EOFXUSER
+  } > "$XUSER_SCRIPT"
 
-chmod +x "$XUSER_SCRIPT"
-echo "[OK] xuser.sh 已生成: $XUSER_SCRIPT"
-echo "[OK] 运行命令：bash $XUSER_SCRIPT 进行用户管理"
+  chmod +x "$XUSER_SCRIPT"
+}
 
-# 导出环境变量供 xuser.sh 使用
-cat > /root/.xray_env << EOF
-export XRAY_DIR="$XRAY_DIR"
-export CONFIG_FILE="$XRAY_DIR/config.json"
-export INFO_FILE="$INFO_FILE"
-EOF
+echo "========== Xray VLESS 自动部署脚本 =========="
 
-echo "[OK] 环境配置已保存到 /root/.xray_env"
-echo ""
-echo "[OK] 配置文件已保存: $CONFIG_FILE_PATH"
-echo "[OK] 用户信息已保存: $INFO_FILE"
-echo ""
-echo "初始用户 VLESS 链接: $VLESS_LINK"
+if [ ! -f "$CONFIG_FILE_PATH" ]; then
+  echo "==> 首次运行，需要配置"
+  if [ -t 0 ]; then
+    read -r -p "请输入配置文件保存路径 [默认 $CONFIG_FILE_PATH]: " custom_path
+    if [ -n "${custom_path:-}" ]; then
+      CONFIG_FILE_PATH="$custom_path"
+    fi
+  fi
+  generate_config_template
+  exit 0
+fi
+
+load_config || {
+  generate_config_template
+  exit 0
+}
+
+normalize_config
+validate_config
+require_root
+
+log "检测运行环境"
+ensure_dependencies
+
+log "下载和安装 Xray"
+resolve_xray_source
+prepare_xray_zip
+install_xray
+
+echo "==> Xray 版本确认"
+detect_installed_xray_version
+
+log "生成 Xray 配置"
+echo "    域名: $DOMAIN"
+echo "    端口: $PORT"
+echo "    证书: $CERT_FILE"
+echo "    私钥: $KEY_FILE"
+echo "    Xray 目录: $XRAY_DIR"
+write_xray_config
+test_xray_config
+
+log "写入 systemd 服务"
+write_systemd_service
+restart_service
+
+write_info_file
+write_env_file
+generate_xuser_script
+
+echo
+echo "========== 部署完成 =========="
+echo "$VLESS_LINK"
+echo "已保存到: $INFO_FILE"
+ok "xuser.sh 已生成: $XUSER_SCRIPT"
+ok "环境配置已保存: $XRAY_ENV_FILE"
+ok "配置文件已保存: $CONFIG_FILE_PATH"
+echo
+echo "运行命令：bash $XUSER_SCRIPT 进行用户管理"
