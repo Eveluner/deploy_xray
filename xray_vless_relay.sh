@@ -1501,40 +1501,90 @@ uninstall() {
   echo "[OK] 已完全卸载 Xray"
 }
 
-show_menu() {
+show_user_menu() {
   echo
   echo "╔════════════════════════════════════════╗"
-  echo "║  Xray 用户管理工具 (xuser.sh)          ║"
+  echo "║              用户操作                  ║"
   echo "╚════════════════════════════════════════╝"
   echo "1) 添加用户"
   echo "2) 删除用户"
   echo "3) 列出所有用户"
   echo "4) 更新 xray_info.txt"
-  echo "5) 一键卸载 Xray"
-  echo "6) 关闭 Xray"
-  echo "7) 显示 Xray 最近 100 条日志"
-  echo "8) 重启 Xray"
-  echo "9) 启动 Xray"
-  echo "10) 更新 Xray 到最新版"
+  echo "0) 返回主菜单"
+  echo
+}
+
+show_xray_menu() {
+  echo
+  echo "╔════════════════════════════════════════╗"
+  echo "║              Xray 操作                 ║"
+  echo "╚════════════════════════════════════════╝"
+  echo "1) 一键卸载 Xray"
+  echo "2) 关闭 Xray"
+  echo "3) 显示 Xray 最近 100 条日志"
+  echo "4) 重启 Xray"
+  echo "5) 启动 Xray"
+  echo "6) 更新 Xray 到最新版"
+  echo "0) 返回主菜单"
+  echo
+}
+
+show_menu() {
+  echo
+  echo "╔════════════════════════════════════════╗"
+  echo "║  Xray 用户管理工具 (xuser.sh)          ║"
+  echo "╚════════════════════════════════════════╝"
+  echo "1) Xray 操作"
+  echo "2) 用户操作"
   echo "0) 退出"
   echo
 }
 
+user_menu() {
+  local choice
+
+  while true; do
+    show_user_menu
+    read -r -p "请选择操作 [0-4]: " choice
+
+    case "$choice" in
+      1) add_user ;;
+      2) del_user ;;
+      3) list_user ;;
+      4) update_info && echo "[OK] xray_info.txt 已更新" ;;
+      0) return 0 ;;
+      *) echo "[ERR] 无效选项" ;;
+    esac
+  done
+}
+
+xray_menu() {
+  local choice
+
+  while true; do
+    show_xray_menu
+    read -r -p "请选择操作 [0-6]: " choice
+
+    case "$choice" in
+      1) uninstall ;;
+      2) stop_xray ;;
+      3) show_xray_logs ;;
+      4) restart_xray && echo "[OK] Xray 已重启" ;;
+      5) start_xray ;;
+      6) update_xray_latest ;;
+      0) return 0 ;;
+      *) echo "[ERR] 无效选项" ;;
+    esac
+  done
+}
+
 while true; do
   show_menu
-  read -r -p "请选择操作 [0-10]: " choice
+  read -r -p "请选择操作 [0-2]: " choice
 
   case "$choice" in
-    1) add_user ;;
-    2) del_user ;;
-    3) list_user ;;
-    4) update_info && echo "[OK] xray_info.txt 已更新" ;;
-    5) uninstall ;;
-    6) stop_xray ;;
-    7) show_xray_logs ;;
-    8) restart_xray && echo "[OK] Xray 已重启" ;;
-    9) start_xray ;;
-    10) update_xray_latest ;;
+    1) xray_menu ;;
+    2) user_menu ;;
     0) echo "退出"; exit 0 ;;
     *) echo "[ERR] 无效选项" ;;
   esac
