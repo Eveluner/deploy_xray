@@ -63,9 +63,36 @@ journalctl -u xray -f
 
 如果修改了 `SERVICE_NAME`，请将命令中的 `xray` 替换为配置的服务名。
 
+## 入口服务器（中转）部署
+
+`xray_vless_relay.sh` 是独立的入口服务器部署脚本，不会修改原来的 `xray_vless_auto.sh`。入口服务器接收客户端的 VLESS + TLS/TCP 连接，并将流量通过你提供的出口 VLESS 节点转发；此版本的出口协议为 VLESS + TLS/TCP。
+
+首次运行会生成独立配置文件 `/root/xray_relay_install.conf`：
+
+```bash
+bash xray_vless_relay.sh
+```
+
+配置入口域名、端口和证书，并填写出口节点信息后部署：
+
+```bash
+bash xray_vless_relay.sh /root/xray_relay_install.conf
+```
+
+出口节点必填参数为 `UPSTREAM_ADDRESS`、`UPSTREAM_PORT`、`UPSTREAM_UUID` 和 `UPSTREAM_SNI`；`UPSTREAM_FLOW` 默认是 `xtls-rprx-vision`，没有 flow 时可设为空。入口端生成的客户端连接信息仍保存在部署信息文件中。
+
+中转部署默认使用独立资源：`/root/xray_relay/`、`/root/xray_relay_info.txt`、`/root/xuser_relay.sh` 和 `xray-relay.service`。因此它可以与原脚本部署的 `xray.service` 并存。管理中转入口用户及服务：
+
+```bash
+bash /root/xuser_relay.sh
+systemctl status xray-relay
+```
+
 ## 配置参数
 
 配置文件使用 Bash 变量格式。路径和选项可按需调整；未设置的可选项会使用默认值。
+
+下表为 `xray_vless_auto.sh` 的参数和默认值；入口服务器脚本的独立路径及上游参数见下文。
 
 | 参数 | 说明 | 默认值 |
 |---|---|---|
@@ -87,6 +114,16 @@ journalctl -u xray -f
 | `SERVICE_NAME` | systemd 服务名称 | `xray` |
 
 `XRAY_ARCH` 可填写 `64`、`arm64-v8a`、`arm32-v7a` 等 Xray 发布包架构名。使用本地 ZIP 安装时，压缩包内必须包含 `xray` 可执行文件。
+
+入口服务器脚本另外使用以下出口节点参数：
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `UPSTREAM_ADDRESS` | 出口服务器域名或 IP | 空，必填 |
+| `UPSTREAM_PORT` | 出口服务器 VLESS 端口 | 空，必填 |
+| `UPSTREAM_UUID` | 出口服务器分配的 UUID | 空，必填 |
+| `UPSTREAM_SNI` | 出口 TLS SNI | 默认使用 `UPSTREAM_ADDRESS` |
+| `UPSTREAM_FLOW` | 出口 VLESS flow | `xtls-rprx-vision` |
 
 ## 部署文件
 
