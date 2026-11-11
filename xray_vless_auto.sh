@@ -753,6 +753,8 @@ write_env_file() {
     printf 'export XRAY_VERSION=%q\n' "$XRAY_VERSION"
     printf 'export XRAY_ARCH=%q\n' "$XRAY_ARCH"
     printf 'export VLESS_FLOW=%q\n' "$VLESS_FLOW"
+    printf 'export CERT_FILE=%q\n' "$CERT_FILE"
+    printf 'export KEY_FILE=%q\n' "$KEY_FILE"
     printf 'export SYSTEMD_DIR=%q\n' "$SYSTEMD_DIR"
     printf 'export SERVICE_NAME=%q\n' "$SERVICE_NAME"
     printf 'export DOMAIN=%q\n' "$DOMAIN"
@@ -791,6 +793,8 @@ SERVICE_NAME="${SERVICE_NAME:-xray}"
 SERVICE_FILE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 DOMAIN="${DOMAIN:-}"
 PORT="${PORT:-}"
+CERT_FILE="${CERT_FILE:-}"
+KEY_FILE="${KEY_FILE:-}"
 
 err() {
   echo "[ERR] $*" >&2
@@ -833,14 +837,21 @@ if not isinstance(inbounds, list) or not inbounds or not isinstance(inbounds[0],
     raise SystemExit("[ERR] 配置文件中没有有效的 inbound")
 
 inbound = inbounds[0]
-if sys.argv[2] == "domain":
+field = sys.argv[2]
+if field in ("domain", "certificate", "key"):
     stream_settings = inbound.get("streamSettings", {})
     if not isinstance(stream_settings, dict):
         raise SystemExit("[ERR] 配置文件中的 streamSettings 格式无效")
     tls_settings = stream_settings.get("tlsSettings", {})
     if not isinstance(tls_settings, dict):
         raise SystemExit("[ERR] 配置文件中的 tlsSettings 格式无效")
-    value = tls_settings.get("serverName")
+    if field == "domain":
+        value = tls_settings.get("serverName")
+    else:
+        certificates = tls_settings.get("certificates", [])
+        if not isinstance(certificates, list) or not certificates or not isinstance(certificates[0], dict):
+            raise SystemExit("[ERR] 配置文件中没有有效的证书设置")
+        value = certificates[0].get("certificate" if field == "certificate" else "key")
 else:
     value = inbound.get("port")
 print(value or "")
@@ -877,6 +888,20 @@ current_port() {
   else
     get_info_value "端口"
   fi
+}
+
+current_certificate() {
+  local value
+
+  value="$(read_config_field certificate)" || return 1
+  printf '%s\n' "${value:-${CERT_FILE:-}}"
+}
+
+current_key() {
+  local value
+
+  value="$(read_config_field key)" || return 1
+  printf '%s\n' "${value:-${KEY_FILE:-}}"
 }
 
 make_backup() {
@@ -947,6 +972,323 @@ finish_config_change() {
   fi
 
   rm -f "$backup"
+}
+
+save_runtime_env() {
+  local temp_file
+
+  mkdir -p -m 0700 "$(dirname "$XRAY_ENV_FILE")" || return 1
+  temp_file="$(mktemp "${XRAY_ENV_FILE}.new.XXXXXX")" || return 1
+  {
+    printf 'export XRAY_DIR=%q\n' "$XRAY_DIR"
+    printf 'export CONFIG_FILE=%q\n' "$CONFIG_FILE"
+    printf 'export BIN=%q\n' "$BIN"
+    printf 'export INFO_FILE=%q\n' "$INFO_FILE"
+    printf 'export XUSER_SCRIPT=%q\n' "$XUSER_SCRIPT"
+    printf 'export XRAY_VERSION=%q\n' "$XRAY_VERSION"
+    printf 'export XRAY_ARCH=%q\n' "$XRAY_ARCH"
+    printf 'export VLESS_FLOW=%q\n' "$VLESS_FLOW"
+    printf 'export CERT_FILE=%q\n' "$CERT_FILE"
+    printf 'export KEY_FILE=%q\n' "$KEY_FILE"
+    printf 'export SYSTEMD_DIR=%q\n' "$SYSTEMD_DIR"
+    printf 'export SERVICE_NAME=%q\n' "$SERVICE_NAME"
+    printf 'export DOMAIN=%q\n' "$DOMAIN"
+    printf 'export PORT=%q\n' "$PORT"
+  } > "$temp_file" || {
+    rm -f "$temp_file"
+    return 1
+  }
+  if ! chmod 600 "$temp_file" || ! mv -f "$temp_file" "$XRAY_ENV_FILE"; then
+    rm -f "$temp_file"
+    return 1
+  fi
+}
+
+write_runtime_service() {
+  local temp_file
+
+  mkdir -p "$(dirname "$SERVICE_FILE")" || return 1
+  temp_file="$(mktemp "${SERVICE_FILE}.new.XXXXXX")" || return 1
+  cat > "$temp_file" << EOF
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="$BIN" run -config "$CONFIG_FILE"
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if ! chmod 0644 "$temp_file" || ! mv -f "$temp_file" "$SERVICE_FILE"; then
+    rm -f "$temp_file"
+    return 1
+  fi
+}
+
+change_config_field() {
+  local field="$1"
+  local value="$2"
+  local extra="${3:-}"
+  local backup
+
+  require_root || return 1
+  require_runtime || return 1
+  backup="$(make_backup)" || return 1
+  if ! python3 - "$CONFIG_FILE" "$field" "$value" "$extra" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+config_file, field, value, extra = sys.argv[1:5]
+with open(config_file, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+try:
+    inbound = config["inbounds"][0]
+    if field == "port":
+        inbound["port"] = int(value)
+    else:
+        tls = inbound["streamSettings"]["tlsSettings"]
+        if field == "domain":
+            tls["serverName"] = value
+        else:
+            certificates = tls.get("certificates")
+            if not isinstance(certificates, list) or not certificates or not isinstance(certificates[0], dict):
+                raise ValueError("配置文件中没有有效的证书设置")
+            if field == "certificates":
+                certificates[0]["certificate"] = value
+                certificates[0]["key"] = extra
+            else:
+                certificates[0]["certificate" if field == "certificate" else "key"] = value
+except (KeyError, IndexError, TypeError, ValueError) as exc:
+    raise SystemExit(f"[ERR] 无法更新配置: {exc}")
+
+directory = os.path.dirname(config_file) or "."
+fd, temp_path = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, config_file)
+except Exception:
+    try:
+        os.unlink(temp_path)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+  then
+    rm -f "$backup"
+    return 1
+  fi
+
+  finish_config_change "$backup" || return 1
+}
+
+change_port_or_domain() {
+  local field="$1"
+  local value
+  local prompt
+
+  if [ "$field" = "port" ]; then
+    prompt="请输入新的监听端口"
+    read -r -p "$prompt: " value
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+      err "端口必须是 1-65535 之间的数字"
+      return 1
+    fi
+  else
+    prompt="请输入新的域名"
+    read -r -p "$prompt: " value
+    if [ "${#value}" -gt 253 ] ||
+      ! [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$ ]]; then
+      err "请输入有效的 DNS 域名"
+      return 1
+    fi
+  fi
+
+  change_config_field "$field" "$value" || return 1
+  if [ "$field" = "port" ]; then
+    PORT="$value"
+  else
+    DOMAIN="$value"
+  fi
+  save_runtime_env || {
+    err "配置已生效，但无法保存环境文件: $XRAY_ENV_FILE"
+    return 1
+  }
+  if [ "$field" = "port" ]; then
+    echo "[OK] 已更新监听端口，Xray 已重启"
+  else
+    echo "[OK] 已更新域名，Xray 已重启"
+  fi
+}
+
+change_certificate_paths() {
+  local certificate
+  local key
+  local current_certificate_path
+  local current_key_path
+
+  current_certificate_path="$(current_certificate)" || return 1
+  current_key_path="$(current_key)" || return 1
+  echo "当前证书: $current_certificate_path"
+  echo "当前私钥: $current_key_path"
+  read -r -p "请输入新的证书文件完整路径: " certificate
+  read -r -p "请输入新的私钥文件完整路径: " key
+  if [ -z "$certificate" ] || [[ "$certificate" == *$'\n'* || "$certificate" == *$'\r'* ]] ||
+    [ ! -f "$certificate" ] || [ ! -r "$certificate" ]; then
+    err "证书文件不存在或不可读"
+    return 1
+  fi
+  if [ -z "$key" ] || [[ "$key" == *$'\n'* || "$key" == *$'\r'* ]] ||
+    [ ! -f "$key" ] || [ ! -r "$key" ]; then
+    err "私钥文件不存在或不可读"
+    return 1
+  fi
+
+  change_config_field certificates "$certificate" "$key" || return 1
+  CERT_FILE="$certificate"
+  KEY_FILE="$key"
+  save_runtime_env || {
+    err "配置已生效，但无法保存环境文件: $XRAY_ENV_FILE"
+    return 1
+  }
+  echo "[OK] 已更新证书和私钥路径，Xray 已重启"
+}
+
+change_xray_directory() {
+  local new_dir
+  local old_dir="$XRAY_DIR"
+  local old_config="$CONFIG_FILE"
+  local old_bin="$BIN"
+  local backup_dir
+  local service_copy
+  local env_copy
+  local info_copy
+  local info_existed=0
+
+  require_root || return 1
+  require_runtime || return 1
+  read -r -p "请输入新的 Xray 安装目录（绝对路径）: " new_dir
+  while [[ "$new_dir" == */ ]]; do
+    new_dir="${new_dir%/}"
+  done
+  if [ -z "$new_dir" ] || [[ "$new_dir" != /* || "$new_dir" == *$'\n'* || "$new_dir" == *$'\r'* ]] ||
+    [[ "$new_dir" == *"/../"* || "$new_dir" == */.. ]] || [ -e "$new_dir" ] || [ -L "$new_dir" ]; then
+    err "新目录必须是不存在的安全绝对路径"
+    return 1
+  fi
+  case "$new_dir" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      err "新目录指向高风险系统目录"
+      return 1
+      ;;
+  esac
+  case "$new_dir/" in
+    "$old_dir/"*)
+      err "新目录不能位于当前 Xray 目录内部"
+      return 1
+      ;;
+  esac
+  case "$old_dir/" in
+    "$new_dir/"*)
+      err "新目录不能包含当前 Xray 目录"
+      return 1
+      ;;
+  esac
+  if [ "$new_dir" = "$old_dir" ]; then
+    err "新目录与当前目录相同"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$new_dir")" || return 1
+  if ! cp -a -- "$old_dir" "$new_dir"; then
+    err "复制 Xray 文件到新目录失败"
+    rm -rf -- "$new_dir"
+    return 1
+  fi
+  backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/xray_dir_change.XXXXXX")" || {
+    rm -rf -- "$new_dir"
+    return 1
+  }
+  service_copy="$backup_dir/service"
+  env_copy="$backup_dir/env"
+  info_copy="$backup_dir/info"
+  if ! cp -a -- "$SERVICE_FILE" "$service_copy" || ! cp -a -- "$XRAY_ENV_FILE" "$env_copy"; then
+    err "备份服务或环境文件失败"
+    rm -rf -- "$new_dir" "$backup_dir"
+    return 1
+  fi
+  if [ -f "$INFO_FILE" ]; then
+    cp -a -- "$INFO_FILE" "$info_copy" || {
+      err "备份用户信息文件失败"
+      rm -rf -- "$new_dir" "$backup_dir"
+      return 1
+    }
+    info_existed=1
+  fi
+
+  XRAY_DIR="$new_dir"
+  CONFIG_FILE="$XRAY_DIR/config.json"
+  BIN="$XRAY_DIR/xray"
+  if ! "$BIN" run -test -config "$CONFIG_FILE" >/dev/null ||
+    ! write_runtime_service ||
+    ! save_runtime_env ||
+    ! systemctl daemon-reload ||
+    ! systemctl restart "$SERVICE_NAME" ||
+    ! update_info; then
+    err "迁移失败，正在恢复旧目录和服务"
+    cp -a -- "$service_copy" "$SERVICE_FILE" || err "恢复 systemd 服务文件失败"
+    cp -a -- "$env_copy" "$XRAY_ENV_FILE" || err "恢复环境文件失败"
+    if [ "$info_existed" -eq 1 ]; then
+      cp -a -- "$info_copy" "$INFO_FILE" || err "恢复用户信息文件失败"
+    else
+      rm -f -- "$INFO_FILE"
+    fi
+    XRAY_DIR="$old_dir"
+    CONFIG_FILE="$old_config"
+    BIN="$old_bin"
+    systemctl daemon-reload || err "systemd 重新加载失败"
+    systemctl restart "$SERVICE_NAME" || err "旧目录中的 Xray 服务未能恢复"
+    rm -rf -- "$new_dir" "$backup_dir"
+    return 1
+  fi
+
+  rm -rf -- "$backup_dir"
+  echo "[OK] Xray 已切换到 $new_dir；旧目录 $old_dir 已保留，可确认无误后手动删除"
+}
+
+show_config_menu() {
+  local choice
+
+  while true; do
+    echo
+    echo "========== 配置管理 =========="
+    echo "1) 更改监听端口"
+    echo "2) 更改证书和私钥文件位置"
+    echo "3) 更改 Xray 安装目录"
+    echo "4) 更改域名"
+    echo "0) 返回主菜单"
+    read -r -p "请选择操作 [0-4]: " choice
+    case "$choice" in
+      1) change_port_or_domain port || echo "[ERR] 端口未更改" ;;
+      2) change_certificate_paths || echo "[ERR] 证书配置未更改" ;;
+      3) change_xray_directory || echo "[ERR] Xray 目录未更改" ;;
+      4) change_port_or_domain domain || echo "[ERR] 域名未更改" ;;
+      0) return 0 ;;
+      *) err "无效选项" ;;
+    esac
+  done
 }
 
 stop_xray() {
@@ -1440,40 +1782,92 @@ uninstall() {
   echo "[OK] 已完全卸载 Xray"
 }
 
-show_menu() {
+show_user_menu() {
   echo
   echo "╔════════════════════════════════════════╗"
-  echo "║  Xray 用户管理工具 (xuser.sh)          ║"
+  echo "║              用户操作                  ║"
   echo "╚════════════════════════════════════════╝"
   echo "1) 添加用户"
   echo "2) 删除用户"
   echo "3) 列出所有用户"
   echo "4) 更新 xray_info.txt"
-  echo "5) 一键卸载 Xray"
-  echo "6) 关闭 Xray"
-  echo "7) 显示 Xray 最近 100 条日志"
-  echo "8) 重启 Xray"
-  echo "9) 启动 Xray"
-  echo "10) 更新 Xray 到最新版"
+  echo "0) 返回主菜单"
+  echo
+}
+
+show_xray_menu() {
+  echo
+  echo "╔════════════════════════════════════════╗"
+  echo "║              Xray 操作                 ║"
+  echo "╚════════════════════════════════════════╝"
+  echo "1) 一键卸载 Xray"
+  echo "2) 关闭 Xray"
+  echo "3) 显示 Xray 最近 100 条日志"
+  echo "4) 重启 Xray"
+  echo "5) 启动 Xray"
+  echo "6) 更新 Xray 到最新版"
+  echo "7) 配置管理"
+  echo "0) 返回主菜单"
+  echo
+}
+
+show_menu() {
+  echo
+  echo "╔════════════════════════════════════════╗"
+  echo "║  Xray 用户管理工具 (xuser.sh)          ║"
+  echo "╚════════════════════════════════════════╝"
+  echo "1) Xray 操作"
+  echo "2) 用户操作"
   echo "0) 退出"
   echo
 }
 
+user_menu() {
+  local choice
+
+  while true; do
+    show_user_menu
+    read -r -p "请选择操作 [0-4]: " choice
+
+    case "$choice" in
+      1) add_user ;;
+      2) del_user ;;
+      3) list_user ;;
+      4) update_info && echo "[OK] xray_info.txt 已更新" ;;
+      0) return 0 ;;
+      *) echo "[ERR] 无效选项" ;;
+    esac
+  done
+}
+
+xray_menu() {
+  local choice
+
+  while true; do
+    show_xray_menu
+    read -r -p "请选择操作 [0-7]: " choice
+
+    case "$choice" in
+      1) uninstall ;;
+      2) stop_xray ;;
+      3) show_xray_logs ;;
+      4) restart_xray && echo "[OK] Xray 已重启" ;;
+      5) start_xray ;;
+      6) update_xray_latest ;;
+      7) show_config_menu ;;
+      0) return 0 ;;
+      *) echo "[ERR] 无效选项" ;;
+    esac
+  done
+}
+
 while true; do
   show_menu
-  read -r -p "请选择操作 [0-10]: " choice
+  read -r -p "请选择操作 [0-2]: " choice
 
   case "$choice" in
-    1) add_user ;;
-    2) del_user ;;
-    3) list_user ;;
-    4) update_info && echo "[OK] xray_info.txt 已更新" ;;
-    5) uninstall ;;
-    6) stop_xray ;;
-    7) show_xray_logs ;;
-    8) restart_xray && echo "[OK] Xray 已重启" ;;
-    9) start_xray ;;
-    10) update_xray_latest ;;
+    1) xray_menu ;;
+    2) user_menu ;;
     0) echo "退出"; exit 0 ;;
     *) echo "[ERR] 无效选项" ;;
   esac
